@@ -27,6 +27,8 @@
 #    UCF_TRAIN_NORMAL 1 = tải thêm 38 GB video bình thường của UCF-Crime để fit bank (mặc định: 0)
 #    KEEP_ZIPS     1 = giữ file zip sau khi giải nén     (mặc định: 0)
 #    PYTHON        trình thông dịch Python               (mặc định: python3)
+#    PARALLEL      1 = tải các bộ song song (chỉ với --download-only)        (mặc định: 1)
+#    RCLONE_REMOTE tên remote Google Drive của rclone cho UIT-ADrone        (mặc định: gdrive)
 #
 #  Dung lượng ước tính: A2Seek ~vài GB (+ video test), UIT-ADrone ~(Drive), Drone-Anomaly ~vài GB,
 #  UCF-Crime ~30 GB (test) / +38 GB (train normal), XD-Violence test ~800 video.
@@ -49,6 +51,8 @@ UCF_TRAIN_NORMAL="${UCF_TRAIN_NORMAL:-0}"
 KEEP_ZIPS="${KEEP_ZIPS:-0}"
 MAX_VIDEOS="${MAX_VIDEOS:-}"
 MAX_FRAMES="${MAX_FRAMES:-}"
+PARALLEL="${PARALLEL:-1}"
+export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"   # tải Hugging Face nhiều luồng
 
 DO_DOWNLOAD=1
 DO_BENCH=1
@@ -87,7 +91,7 @@ setup() {
   "$PYTHON" - <<'EOF' || { c_err "Thiếu package của dự án: chạy 'pip install -e .' trước"; exit 1; }
 import edgestream, perception, cv2, numpy, yaml  # noqa
 EOF
-  "$PYTHON" -m pip install -q "huggingface_hub>=0.30" gdown pyarrow pillow >/dev/null
+  "$PYTHON" -m pip install -q -U "huggingface_hub[hf_xet]>=0.32" gdown pyarrow pillow >/dev/null
   if [ ! -f weights/falcon_yolo_lqcv2_baseline_jde_mot.pth ]; then
     c_warn "Không thấy weights/falcon_yolo_lqcv2_baseline_jde_mot.pth — perception sẽ không chạy được"
   fi
@@ -279,7 +283,23 @@ EOF
 # ------------------------------------------------------------------------------ main
 c_info "Datasets: ${DATASETS[*]} | DATA_DIR=$DATA_DIR | RUN_DIR=$RUN_DIR | download=$DO_DOWNLOAD bench=$DO_BENCH"
 setup
-for ds in "${DATASETS[@]}"; do
+if [ "$DO_BENCH" = 0 ] && [ "$PARALLEL" = 1 ] && [ ${#DATASETS[@]} -gt 1 ]; then
+  # chỉ tải: chạy các bộ cùng lúc, mỗi bộ một log riêng
+  pids=""
+  for ds in "${DATASETS[@]}"; do
+    c_info "Tải song song: $ds  (log: $RUN_DIR/download_$ds.log)"
+    ( set -Eeuo pipefail; "run_$ds" ) > "$RUN_DIR/download_$ds.log" 2>&1 &
+    pids="$pids $!:$ds"
+  done
+  for p in $pids; do
+    pid="${p%%:*}"; ds="${p#*:}"
+    set +e; wait "$pid"; rc=$?; set -e
+    case $rc in 0) st="ok" ;; "$SKIP") st="bỏ qua (thiếu dữ liệu)" ;; *) st="LỖI (mã $rc) — xem $RUN_DIR/download_$ds.log" ;; esac
+    STATUS_LINES="${STATUS_LINES}$(printf '   %-15s %s' "$ds" "$st")"$'\n'
+  done
+  DATASETS=()
+fi
+for ds in ${DATASETS[@]+"${DATASETS[@]}"}; do
   c_info "================ $ds ================"
   # chạy mỗi bộ trong subshell riêng (để lỗi ở một bộ không dừng các bộ khác); không đặt trong 'if'
   # vì bash tắt 'set -e' trong điều kiện của if

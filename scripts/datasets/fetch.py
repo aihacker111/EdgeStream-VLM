@@ -43,10 +43,13 @@ def log(msg: str) -> None:
 
 
 def hf_download(repo: str, local_dir: Path, patterns=None) -> None:
+    import os
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")      # many parallel streams (hf_xet)
     from huggingface_hub import snapshot_download
     local_dir.mkdir(parents=True, exist_ok=True)
+    # resumable: files already in local_dir are skipped, interrupted ones continue
     snapshot_download(repo_id=repo, repo_type="dataset", local_dir=str(local_dir),
-                      allow_patterns=patterns, max_workers=8)
+                      allow_patterns=patterns, max_workers=int(os.environ.get("HF_WORKERS", "16")))
 
 
 def unzip_once(z: Path, dest: Path) -> None:
@@ -207,9 +210,24 @@ def cmd_ucf(a) -> None:
 
 
 # ---------------------------------------------------------------------------------------- UIT-ADrone
+UIT_FOLDER_ID = "1ygWcuOZ7kEwS-rC35gWv6f6qeNx0BHyg"
+
+
 def cmd_uit(a) -> None:
+    """rclone (fast, parallel, resumable) when a Google Drive remote is configured, else gdown."""
+    import os
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    remote = os.environ.get("RCLONE_REMOTE", "gdrive")
+    if shutil.which("rclone"):
+        remotes = subprocess.run(["rclone", "listremotes"], capture_output=True, text=True).stdout.split()
+        if f"{remote}:" in remotes:
+            log(f"rclone {remote}: (folder {UIT_FOLDER_ID}) -> {out}")
+            subprocess.run(["rclone", "copy", f"{remote}:", str(out), "--drive-root-folder-id", UIT_FOLDER_ID,
+                            "--transfers", os.environ.get("RCLONE_TRANSFERS", "16"), "--checkers", "16",
+                            "--drive-chunk-size", "64M", "--drive-acknowledge-abuse", "-P"], check=True)
+            return
+        log(f"rclone found but no '{remote}:' remote — run 'rclone config' once (type: drive) for fast downloads")
     try:
         subprocess.run([sys.executable, "-m", "gdown", "--folder", "--remaining-ok", UIT_DRIVE, "-O", str(out)],
                        check=True)
