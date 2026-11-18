@@ -117,6 +117,9 @@ def cmd_a2seek_videos(a) -> None:
     samples = root / "dataset" / a.variant / f"{a.split}.jsonl"
     rows = [json.loads(x) for x in samples.read_text().splitlines() if x.strip()]
     wanted = {f"{r['g_id']}/{r['v_id']}" for r in rows}
+    if a.max_clips:                               # quick test: a few clips spread over the split
+        ordered = sorted(wanted)
+        wanted = set(ordered[:: max(1, len(ordered) // a.max_clips)][: a.max_clips])
     files = HfApi().list_repo_files("tiu2mo/A2Seek-Videos", repo_type="dataset")
     by_clip = {}
     for f in files:
@@ -304,6 +307,7 @@ def main(argv=None):
     p.add_argument("--videos", default="data/A2Seek-Videos")
     p.add_argument("--split", default="test")
     p.add_argument("--variant", default="cot_single")
+    p.add_argument("--max-clips", type=int, default=None)
     p = sub.add_parser("xd-violence")
     p.add_argument("--out", default="data/XD-Violence")
     p.add_argument("--max-videos", type=int, default=None)

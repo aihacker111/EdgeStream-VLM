@@ -12,13 +12,15 @@
 #  Các bộ: a2seek  uit_adrone  drone_anomaly  muvad  ucf_crime  xd_violence
 #
 #  Tùy chỉnh bằng biến môi trường, ví dụ:
-#    VLM=openai VLM_MODEL=qwen3-vl:8b BUDGETS="0 2 6 12" STRIDE=2 bash scripts/run_benchmarks.sh a2seek
+#    VLM_MODEL=Qwen/Qwen3-VL-4B-Instruct BUDGETS="0 2 6 12" STRIDE=2 bash scripts/run_benchmarks.sh a2seek
 #
 #    DATA_DIR      nơi chứa dữ liệu                      (mặc định: data)
 #    RUN_DIR       nơi ghi kết quả                       (mặc định: runs/bench_<ngày giờ>)
-#    VLM           openai | oracle | simulated           (mặc định: openai = VLM thật qua Ollama/vLLM)
-#    VLM_URL       OpenAI-compatible endpoint            (mặc định: http://localhost:11434/v1 = Ollama)
-#    VLM_MODEL     tên model trên server                 (mặc định: qwen3-vl:4b)
+#    VLM           transformers | openai | oracle | simulated
+#                  (mặc định: transformers = model Hugging Face chạy trực tiếp trên máy, không cần server)
+#    VLM_MODEL     transformers: id trên Hugging Face    (mặc định: Qwen/Qwen3-VL-2B-Instruct)
+#                  openai: tên model trên server         (mặc định: qwen3-vl:4b)
+#    VLM_URL       chỉ cho openai: OpenAI-compatible endpoint (mặc định: http://localhost:11434/v1 = Ollama)
 #    BUDGETS       số lượt gọi VLM / phút cần quét       (mặc định: "0 2 6 12"; 0 = chỉ tầng rẻ)
 #    STRIDE        xử lý 1 trên k frame                  (mặc định: 1 cho UAV, 2 cho CCTV 30 fps)
 #    MAX_VIDEOS    giới hạn số video mỗi bộ (debug)      (mặc định: không giới hạn)
@@ -42,9 +44,9 @@ cd "$ROOT"
 PYTHON="${PYTHON:-python3}"
 DATA_DIR="${DATA_DIR:-data}"
 RUN_DIR="${RUN_DIR:-runs/bench_$(date +%Y%m%d_%H%M)}"
-VLM="${VLM:-openai}"
+VLM="${VLM:-transformers}"
 VLM_URL="${VLM_URL:-http://localhost:11434/v1}"
-VLM_MODEL="${VLM_MODEL:-qwen3-vl:4b}"
+if [ "$VLM" = openai ]; then VLM_MODEL="${VLM_MODEL:-qwen3-vl:4b}"; else VLM_MODEL="${VLM_MODEL:-Qwen/Qwen3-VL-2B-Instruct}"; fi
 BUDGETS="${BUDGETS:-0 2 6 12}"
 FIT_BANK="${FIT_BANK:-1}"
 UCF_TRAIN_NORMAL="${UCF_TRAIN_NORMAL:-0}"
@@ -87,13 +89,32 @@ STATUS_LINES=""
 
 # ------------------------------------------------------------------------------ setup
 setup() {
-  c_info "Kiểm tra môi trường Python"
-  "$PYTHON" - <<'EOF' || { c_err "Thiếu package của dự án: chạy 'pip install -e .' trước"; exit 1; }
-import edgestream, perception, cv2, numpy, yaml  # noqa
-EOF
+  c_info "Kiểm tra môi trường Python ($("$PYTHON" -c 'import sys; print(sys.executable)'))"
+  if ! "$PYTHON" -c "import edgestream, perception, cv2, numpy, yaml" 2>/dev/null; then
+    c_info "Chưa cài dự án vào môi trường này -> pip install -e .  (lần đầu mất vài phút: torch, ultralytics)"
+    "$PYTHON" -m pip install -e . || { c_err "pip install -e . thất bại (xem lỗi phía trên)"; exit 1; }
+  fi
   "$PYTHON" -m pip install -q -U "huggingface_hub[hf_xet]>=0.32" gdown pyarrow pillow >/dev/null
-  if [ ! -f weights/falcon_yolo_lqcv2_baseline_jde_mot.pth ]; then
-    c_warn "Không thấy weights/falcon_yolo_lqcv2_baseline_jde_mot.pth — perception sẽ không chạy được"
+  if [ "$DO_BENCH" = 1 ] && [ ! -f weights/falcon_yolo_lqcv2_baseline_jde_mot.pth ]; then
+    if [ -f "$HOME/Downloads/falcon_yolo_lqcv2_baseline_jde_mot.pth" ]; then
+      c_info "Chép checkpoint từ ~/Downloads vào weights/"
+      mkdir -p weights && cp "$HOME/Downloads/falcon_yolo_lqcv2_baseline_jde_mot.pth" weights/
+    else
+      c_err "Thiếu weights/falcon_yolo_lqcv2_baseline_jde_mot.pth (checkpoint MOT 960x544 của AERO-MOT)"; exit 1
+    fi
+  fi
+  if [ "$DO_BENCH" = 1 ] && [ "$VLM" = transformers ]; then
+    "$PYTHON" -m pip install -q -U "transformers>=4.57" accelerate >/dev/null
+    c_info "Tải model $VLM_MODEL từ Hugging Face (lần đầu; 2B ≈ 4–5 GB, 4B ≈ 9 GB, 8B ≈ 17 GB)"
+    "$PYTHON" - "$VLM_MODEL" <<'PY'
+import sys, torch
+from huggingface_hub import snapshot_download
+snapshot_download(sys.argv[1], allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja"], max_workers=16)
+dev = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"[vlm] {sys.argv[1]} ready, will run on {dev}")
+if dev == "cpu":
+    print("[vlm] WARNING: no GPU/MPS — each VLM call will take tens of seconds")
+PY
   fi
   if [ "$DO_BENCH" = 1 ] && [ "$VLM" = openai ]; then
     if curl -sf "${VLM_URL%/v1}/api/tags" >/dev/null 2>&1; then
@@ -108,6 +129,7 @@ EOF
       c_err "Không kết nối được VLM ở $VLM_URL."
       echo "   Mở Ollama:  ollama serve &  &&  ollama pull $VLM_MODEL"
       echo "   hoặc vLLM:  vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000  (VLM_URL=http://localhost:8000/v1)"
+      echo "   hoặc chạy model Hugging Face trực tiếp:  VLM=transformers"
       echo "   hoặc chạy không cần VLM:  VLM=oracle (cận trên) / VLM=simulated (chỉ kiểm tra pipeline)"
       exit 1
     fi
@@ -154,7 +176,9 @@ run_a2seek() {
   local map="$root/edgestream_videos_test.json"
   if [ "$DO_DOWNLOAD" = 1 ]; then
     fetch a2seek --root "$root"
-    fetch a2seek-videos --root "$root" --videos "$vids" --split test
+    local extra=()
+    [ -n "$MAX_VIDEOS" ] && extra+=(--max-clips "$MAX_VIDEOS")
+    fetch a2seek-videos --root "$root" --videos "$vids" --split test ${extra[@]+"${extra[@]}"}
   fi
   [ "$DO_BENCH" = 1 ] || return 0
   [ -f "$map" ] || skip "A2Seek: chưa có $map (chạy lại không có --bench-only)"

@@ -85,9 +85,10 @@ vlm:
     api_key: EMPTY
     use_schema: true
     logprobs: true
-  transformers:
-    model_id: Qwen/Qwen3-VL-2B-Instruct
+  transformers:                    # local Hugging Face model, no server (CUDA / Apple MPS / CPU)
+    model_id: Qwen/Qwen3-VL-2B-Instruct  # or Qwen/Qwen3-VL-4B-Instruct (>= 16 GB RAM), -8B (>= 32 GB)
     device: auto
+    dtype: auto
 
 events:
   merge_gap_s: 10.0

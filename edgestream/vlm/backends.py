@@ -166,34 +166,57 @@ class OpenAICompatBackend(VLMBackend):
 
 # ---------------------------------------------------------------------- transformers
 class TransformersBackend(VLMBackend):
-    """Local HF model, e.g. ``Qwen/Qwen3-VL-2B-Instruct``. JSON is enforced by parsing only."""
+    """Local Hugging Face model (no server), e.g. ``Qwen/Qwen3-VL-2B-Instruct``.
+
+    Runs on CUDA, Apple-silicon MPS or CPU (``device: auto`` picks in that order). Needs
+    transformers >= 4.57 (Qwen3-VL). JSON is enforced by parsing; P(yes) comes from the scores
+    at the verdict token, like the logprobs of the server backend.
+    """
     name = "transformers"
 
-    def __init__(self, model_id: str, device: str = "auto", dtype: str = "auto"):
+    def __init__(self, model_id: str, device: str = "auto", dtype: str = "auto",
+                 attn_implementation: str | None = None):
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
         self.torch = torch
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else (
+                "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
+        if dtype == "auto":
+            dtype = {"cuda": torch.bfloat16, "mps": torch.bfloat16}.get(device.split(":")[0], torch.float32)
+        elif isinstance(dtype, str):
+            dtype = getattr(torch, dtype)
+        self.device = torch.device(device)
+        kw = {"dtype": dtype}
+        if attn_implementation:
+            kw["attn_implementation"] = attn_implementation
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_id, torch_dtype=dtype, device_map=device).eval()
+        try:
+            self.model = AutoModelForImageTextToText.from_pretrained(model_id, **kw)
+        except TypeError:                                   # transformers < 4.56 calls it torch_dtype
+            kw["torch_dtype"] = kw.pop("dtype")
+            self.model = AutoModelForImageTextToText.from_pretrained(model_id, **kw)
+        self.model.to(self.device).eval()
+        self.model_id = model_id
 
     def generate(self, req: VLMRequest) -> RawResult:
         from PIL import Image
-        content, images = [], []
+        content = []
         for kind, val in req.parts:
             if kind == "text":
                 content.append({"type": "text", "text": val})
             else:
-                images.append(Image.fromarray(cv2.cvtColor(val, cv2.COLOR_BGR2RGB)))
-                content.append({"type": "image"})
+                content.append({"type": "image", "image": Image.fromarray(cv2.cvtColor(val, cv2.COLOR_BGR2RGB))})
         messages = [{"role": "system", "content": [{"type": "text", "text": req.system}]},
                     {"role": "user", "content": content}]
-        prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        inputs = self.processor(text=[prompt], images=images, return_tensors="pt").to(self.model.device)
+        inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
+                                                    return_dict=True, return_tensors="pt").to(self.device)
         t0 = time.perf_counter()
-        with self.torch.no_grad():
+        with self.torch.inference_mode():
             out = self.model.generate(**inputs, max_new_tokens=req.max_new_tokens, do_sample=False,
                                       output_scores=True, return_dict_in_generate=True)
+        if self.device.type == "mps":
+            self.torch.mps.synchronize()
         dt = time.perf_counter() - t0
         n_in = inputs["input_ids"].shape[1]
         gen = out.sequences[0, n_in:]

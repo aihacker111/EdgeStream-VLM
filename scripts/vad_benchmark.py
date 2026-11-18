@@ -88,6 +88,8 @@ def main(argv=None):
         cfg["vlm"]["openai"]["base_url"] = a.vlm_url
     if a.vlm_model:
         cfg["vlm"]["openai"]["model"] = a.vlm_model
+        cfg["vlm"]["transformers"]["model_id"] = a.vlm_model if "/" in a.vlm_model else \
+            cfg["vlm"]["transformers"]["model_id"]
     videos = load_dataset(a)[: a.max_videos]
     if not videos:
         sys.exit("No videos found: check --videos / --annotations / --labels")
@@ -96,11 +98,13 @@ def main(argv=None):
     print(f"{len(videos)} videos, budgets {a.budgets}, stride {a.stride}, VLM {cfg['vlm']['backend']}")
 
     rows = []
+    shared_vlm = None                    # load a local model once for the whole budget sweep
+    capacity = cfg["gate"].get("bucket_capacity", 3.0)
     for budget in a.budgets:
         cfg["gate"]["calls_per_min"] = budget
-        if budget <= 0:
-            cfg["gate"]["bucket_capacity"] = 0.0
-        pipe = VADPipeline(cfg)
+        cfg["gate"]["bucket_capacity"] = 0.0 if budget <= 0 else capacity   # budget 0 must not leak
+        pipe = VADPipeline(cfg, vlm=shared_vlm)
+        shared_vlm = pipe.vlm
         per_on, per_off, preds, cats, calls, dur = {}, {}, [], [], 0, 0.0
         for k, v in enumerate(videos):
             cache_dir = out / "cache" / f"stride{a.stride}" / _safe(v.name)

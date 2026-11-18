@@ -21,6 +21,7 @@ def main(argv=None):
     ap.add_argument("--video", required=True)
     ap.add_argument("--out", default="runs/vad")
     ap.add_argument("--vlm", choices=["simulated", "oracle", "openai", "transformers"], default=None)
+    ap.add_argument("--vlm-model", default=None, help="HF id (transformers) or server model name (openai)")
     ap.add_argument("--budget", type=float, default=None, help="VLM calls per minute")
     ap.add_argument("--labels", default=None, help=".npy / .txt with one 0/1 per frame")
     ap.add_argument("--fps", type=float, default=None)
@@ -33,6 +34,9 @@ def main(argv=None):
     cfg = load_vad_config(a.config)
     if a.vlm:
         cfg["vlm"]["backend"] = a.vlm
+    if a.vlm_model:
+        key = "transformers" if (a.vlm or cfg["vlm"]["backend"]) == "transformers" else "openai"
+        cfg["vlm"][key]["model_id" if key == "transformers" else "model"] = a.vlm_model
     if a.budget is not None:
         cfg["gate"]["calls_per_min"] = a.budget
     labels = None
