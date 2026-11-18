@@ -1,0 +1,11 @@
+id: wrong_way
+version: 1
+name: Wrong-way Driving
+short: a vehicle drives against the direction of traffic
+definition: A vehicle moves opposite to the traffic in its lane or carriageway.
+positive_cues:
+- heads opposite to nearby vehicles on the same carriageway
+negative_cues:
+- a separate carriageway or ramp in the other direction
+- a legal U-turn or turn at an intersection
+severity: high

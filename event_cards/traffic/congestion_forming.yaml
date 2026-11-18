@@ -1,0 +1,13 @@
+id: congestion_forming
+version: 1
+name: Congestion forming
+definition: >
+  Traffic in the marked area slows to a crawl or stops compared with how it was
+  flowing a short while ago.
+positive_cues:
+  - several vehicles in the area are close together and barely moving
+  - a queue is growing behind a point
+negative_cues:
+  - vehicles are stopped at a red light and will move off normally
+  - the area is a parking lot
+severity: low

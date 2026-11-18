@@ -1,0 +1,68 @@
+# Full pipeline configuration. Paths are relative to the project root.
+
+perception_config: configs/perception.yaml
+window_s: 1.0                      # candidates + gate + VLM run once per window
+
+scene:
+  grid: [16, 9]                    # flow-field cells (x, y); finer = fewer mixed carriageways
+  history_s: 20.0
+  ema: 0.05
+  ego_motion: flow                 # flow (UAV / PTZ) | none (fixed CCTV)
+
+candidates:                        # thresholds are in object-sizes per second
+  moving: 0.5
+  stopped: 0.15
+  counter_cos: -0.5
+  stop_min_s: 3.0
+  speeding_z: 3.0
+  congestion_ratio: 0.4
+  grace_s: 2.0
+  min_track_age_s: 2.0
+
+gate:
+  calls_per_min: 6                 # B_call
+  bucket_capacity: 3
+  reserve_frac: 0.2                # kept for critical candidates
+  tau0: 0.5
+  alpha: 0.5                       # density sensitivity
+  beta: 0.5                        # budget sensitivity
+  critical_types: [counter_flow]
+  resend_after_s: 8.0
+  max_sends: 2
+
+memory:
+  budget_tokens: 2048              # B_mem (visual tokens)
+  crop_size: 224
+  crops_per_slot: 3
+  keyframe_width: 448
+  keyframe_every_s: 10.0
+  lambda0: 0.5
+  gamma: 0.3
+
+vlm:
+  backend: simulated               # simulated | openai | transformers
+  cards_dir: event_cards/traffic
+  max_new_tokens: 64               # B_out
+  count_latency: true              # alert time = window time + VLM latency
+  simulated:
+    yes_threshold: 0.75
+  openai:                          # vLLM / SGLang / llama.cpp / LM Studio / Ollama (/v1)
+    base_url: http://localhost:8000/v1
+    model: Qwen/Qwen3-VL-4B-Instruct
+    api_key: EMPTY
+    use_schema: true               # constrained JSON decoding
+    logprobs: true
+  transformers:
+    model_id: Qwen/Qwen3-VL-2B-Instruct
+    device: auto
+
+events:
+  merge_gap_s: 10.0
+  cooldown_s: 30.0
+  clip_pre_s: 3.0
+  save_clips: true
+
+output:
+  video_width: 1280
+  summary_every_s: 30.0
+  save_prompts: true

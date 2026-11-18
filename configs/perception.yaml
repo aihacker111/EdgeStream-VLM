@@ -1,0 +1,28 @@
+# Perception module configuration (detector + AERO-MOT tracker).
+# Paths are relative to the project root.
+
+detector:
+  weights: weights/falcon_yolo_lqcv2_baseline_jde_mot.pth   # JDE (det + 128-d ReID), baseline PAN-FPN, 10 VisDrone classes
+  # weights: weights/falcon_detector_1.pth                  # detection-only alternative (no ReID -> motion-only tracking)
+  cfg: null                                # null = infer from checkpoint (this one -> yolo_falcon_lqcv2_baseline.yaml)
+  num_classes: 10
+  scale: s
+  input_wh: [960, 544]                     # training resolution of the MOT checkpoint
+  letterbox: false
+  conf_thres: 0.40
+  cand_floor: 0.15                         # low-score band used by tracker stage 2.5
+  nms_iou: 0.60
+  max_det: 500
+  device: auto                             # auto | cpu | cuda | mps
+  half: false
+
+tracker:
+  frame_rate: 30
+  use_appearance: auto                     # on iff the checkpoint has a ReID head (QAM + gallery + vMF appearance)
+  params:                                  # overrides on top of the AERO-MOT paper defaults (perception/config.py)
+    max_age: 30
+    minority_large_classes: []             # AERO-MOT VisDrone 5-class eval used [2, 3, 4]
+
+output:
+  min_box_area: 100
+  keep_recovered: true

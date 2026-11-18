@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edgestream-vlm"
+version = "0.1.0"
+description = "Budget-aware streaming VLM event understanding for dense multi-agent scenes on edge devices"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-only" }   # perception/ is derived from AERO-MOT (AGPL-3.0)
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    # Tested with 8.4.215. The baseline detector uses only stock modules; the full
+    # EAD/LQC detector patches ultralytics.parse_model and needs a version whose
+    # source matches (perception/models/lqc.py raises a clear error otherwise).
+    "ultralytics==8.4.215",
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "lap>=0.4",          # same LAPJV solver as AERO-MOT (scipy fallback can break ties differently)
+    "opencv-python>=4.7",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+fast = ["cython-bbox>=0.1.3"]      # faster IoU; a NumPy fallback with identical numbers is built in
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["perception*", "edgestream*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

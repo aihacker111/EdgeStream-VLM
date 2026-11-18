@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+runs/
+weights/*.pth
+weights/*.pt
+*.mp4
+*.mkv
+.DS_Store
+data/videos/
+third_party/
+data/*/

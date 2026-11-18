@@ -1,0 +1,15 @@
+id: counter_flow
+version: 1
+name: Wrong-way / counter-flow movement
+definition: >
+  The marked vehicle moves in the opposite direction to the surrounding traffic
+  in the same lane or carriageway for a sustained period.
+positive_cues:
+  - the marked vehicle heads opposite to most nearby vehicles on the same road
+  - its position across the crops moves against the direction of nearby traffic
+negative_cues:
+  - it is on a different carriageway or ramp that legitimately runs the other way
+  - a legal U-turn or a turn at an intersection
+  - it is parked or reversing slowly to park
+  - the box jumps between different vehicles (tracking error)
+severity: high

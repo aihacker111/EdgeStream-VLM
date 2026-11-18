@@ -1,0 +1,12 @@
+id: speeding
+version: 1
+name: Abnormally fast vehicle
+definition: >
+  The marked vehicle moves much faster than the other vehicles in the same area.
+positive_cues:
+  - it covers clearly more distance between crops than neighbouring vehicles
+  - it overtakes several vehicles in a short time
+negative_cues:
+  - other lanes legitimately flow faster (e.g. an express lane or a different road level)
+  - an apparent jump caused by a tracking error
+severity: low

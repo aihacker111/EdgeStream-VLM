@@ -1,0 +1,14 @@
+id: running
+version: 1
+name: Running
+short: a person runs, sprints or flees much faster than others walk
+definition: A person moves at running speed in a place where people normally walk.
+positive_cues:
+- long strides and much faster than nearby pedestrians
+- sudden sprint, possibly looking back
+- fleeing from another person or a place
+negative_cues:
+- jogging on a running track or sports field
+- children playing a game
+- the box jumped between two people (tracking error)
+severity: medium

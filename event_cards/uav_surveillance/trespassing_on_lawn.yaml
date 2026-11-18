@@ -1,0 +1,14 @@
+id: trespassing_on_lawn
+version: 1
+name: Trespassing on Lawn
+short: a person walks or stands on a lawn / grass area instead of the path
+definition: A person is on a grass or lawn area (or other planted area) where pedestrians normally do
+  not go.
+positive_cues:
+- the person's feet are on grass, not on a paved path
+- other people use the path next to the lawn
+negative_cues:
+- the area is a park lawn where people normally sit or play
+- the person is a gardener or worker
+- the person is on a paved path next to the grass
+severity: low

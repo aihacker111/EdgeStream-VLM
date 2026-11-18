@@ -1,0 +1,12 @@
+id: bullying
+version: 1
+name: Bullying
+short: several people push, corner or harass one person
+definition: One person is pushed, surrounded, cornered or harassed by others.
+positive_cues:
+- a group surrounds one person
+- pushing or grabbing one person repeatedly
+negative_cues:
+- friends playing or hugging
+- a group walking together
+severity: high

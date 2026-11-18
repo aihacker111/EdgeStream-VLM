@@ -1,0 +1,95 @@
+# Streaming object-centric VLM video anomaly detection — fixed CCTV (UCF-Crime, XD-Violence).
+
+
+perception_config: configs/perception.yaml
+window_s: 0.5                      # cheap tier + gate run twice per second
+
+scene:
+  grid: [16, 9]
+  history_s: 20.0
+  ema: 0.05
+  ego_motion: none                 # fixed CCTV
+
+objects:                           # all thresholds in object sizes (scale-free)
+  use_pixels: true                 # residual motion + static change (things the detector misses)
+  window_s: 2.0
+  min_track_age_s: 1.0
+  run_ratio: 2.2                   # running = 2.2x typical walking speed of people in view
+  run_min: 2.0
+  fall_log_aspect: 0.47
+  lying_min_s: 3.0
+  loiter_min_s: 10.0
+  pair_dist: 1.5
+  pair_jitter: 0.6
+  rarity_nats: 1.5
+  rarity_min_exposure: 60.0       # pooled cell-seconds watched before location rarity is trusted
+  knn_ratio: 2.0
+  blob_min_s: 1.0
+  static_min_s: 5.0
+  grace_s: 2.0
+
+traffic:                           # the original traffic rules, mapped to wrong_way / illegal_parking
+  enabled: true
+  moving: 0.5
+  stopped: 0.15
+  min_track_age_s: 2.0
+  types: [counter_flow, stopped_in_flow, sudden_stop]
+  classes: [car, van, truck, bus, motor, tricycle, awning-tricycle]
+
+normality:
+  bank: null                       # e.g. runs/banks/a2seek_train_normal.npz  (warm start, optional)
+  knn: {k: 5, capacity: 4096, min_items: 64, insert_below: 1.5}
+
+gate:
+  calls_per_min: 6                 # VLM budget (sweep this for the budget-AUC curve)
+  bucket_capacity: 3
+  reserve_frac: 0.2
+  tau0: 0.5
+  alpha: 0.5
+  beta: 0.5
+  critical_types: [falling, lying_still, close_interaction, counter_flow]
+  critical_priority: 0.8
+  resend_after_s: 6.0
+  max_sends: 3
+  voi: true                        # value-of-information ordering and re-verification
+
+memory:
+  budget_tokens: 2048
+  crop_size: 224
+  crops_per_slot: 3
+  keyframe_width: 448
+  keyframe_every_s: 10.0
+  lambda0: 0.5
+  gamma: 0.3
+
+scorer:
+  w_unverified: 0.4              # cheap-tier-only belief is capped below a VLM-confirmed one
+  eta: 0.5
+  w_dense: 0.25
+  decay_s: 1.0
+  hold_s: 0.5
+  tau_up_s: 0.25
+  tau_down_s: 0.75
+  probe_threshold: 0.5
+
+vlm:
+  backend: simulated               # simulated | oracle | openai | transformers
+  cards_dir: event_cards/uav_surveillance
+  max_new_tokens: 64
+  count_latency: true
+  simulated: {yes_threshold: 0.75}
+  oracle: {accuracy: 1.0, latency_s: 0.0}
+  openai:
+    base_url: http://localhost:11434/v1          # Ollama; vLLM: http://localhost:8000/v1
+    model: qwen3-vl:4b
+    api_key: EMPTY
+    use_schema: true
+    logprobs: true
+  transformers:
+    model_id: Qwen/Qwen3-VL-2B-Instruct
+    device: auto
+
+events:
+  merge_gap_s: 10.0
+  cooldown_s: 30.0
+  save_clips: false

@@ -1,0 +1,12 @@
+id: littering
+version: 1
+name: Littering
+short: a person throws or leaves rubbish on the ground
+definition: A person throws or leaves rubbish on the ground or into water.
+positive_cues:
+- a small object falls from a person's hand and stays
+- rubbish left behind after the person leaves
+negative_cues:
+- putting rubbish into a bin
+- dropping something and picking it up again
+severity: low

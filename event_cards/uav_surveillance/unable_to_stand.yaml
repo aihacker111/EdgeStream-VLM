@@ -1,0 +1,14 @@
+id: unable_to_stand
+version: 1
+name: Unable to Stand
+short: a person lies on the ground and does not get up
+definition: A person remains lying or slumped on the ground for a long time, apparently unable to get
+  up.
+positive_cues:
+- lying flat and not moving for several seconds
+- others gather around or ignore a lying person
+negative_cues:
+- resting on grass in a park in a relaxed pose
+- sitting normally
+- a static object shaped like a person
+severity: high

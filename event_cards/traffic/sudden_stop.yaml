@@ -1,0 +1,12 @@
+id: sudden_stop
+version: 1
+name: Sudden stop / hard braking
+definition: >
+  The marked vehicle decelerates abruptly from normal speed to (almost) zero.
+positive_cues:
+  - large displacement between early crops, little or none between the last ones
+  - possible contact with another vehicle or an obstacle ahead
+negative_cues:
+  - a normal stop at a stop line or behind a queue
+  - the vehicle left the image or became occluded (tracking loss, not a stop)
+severity: medium

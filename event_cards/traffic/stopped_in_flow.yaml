@@ -1,0 +1,14 @@
+id: stopped_in_flow
+version: 1
+name: Vehicle stopped in moving traffic
+definition: >
+  The marked vehicle is stationary on a travel lane while traffic around it
+  keeps moving (breakdown, illegal stop, obstruction).
+positive_cues:
+  - the vehicle stays in place across the crops while neighbours pass it
+  - it occupies a driving lane, not a shoulder, parking bay or queue at a light
+negative_cues:
+  - it is waiting at a red light or in a queue with other stopped vehicles
+  - it is parked off the carriageway
+  - the camera is moving and the vehicle only appears static in the image
+severity: medium

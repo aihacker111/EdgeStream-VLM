@@ -1,0 +1,13 @@
+id: falling
+version: 1
+name: Falling
+short: a person suddenly falls to the ground
+definition: A person who was standing or walking suddenly collapses, trips or falls down.
+positive_cues:
+- body shape changes from upright to lying within a second or two
+- stays on the ground after the change
+negative_cues:
+- sitting down on a bench or the ground deliberately
+- bending over to pick something up
+- the box changed shape because of occlusion
+severity: high

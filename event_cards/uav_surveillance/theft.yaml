@@ -1,0 +1,13 @@
+id: theft
+version: 1
+name: Theft
+short: a person takes something that is not theirs (bike, bag, item)
+definition: A person takes an object that belongs to someone else, e.g. a bicycle, bag or item, often
+  then leaves quickly.
+positive_cues:
+- handles a parked bicycle or vehicle and takes it
+- takes an item from a person or place and leaves quickly
+negative_cues:
+- the owner takes their own bike
+- handing an object over normally
+severity: high

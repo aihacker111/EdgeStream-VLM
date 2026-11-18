@@ -1,0 +1,13 @@
+id: jaywalking
+version: 1
+name: Jaywalking
+short: a person crosses the road outside a crossing or walks on the carriageway
+definition: A pedestrian is on the vehicle road away from a zebra crossing, crossing between cars or walking
+  along the lane.
+positive_cues:
+- the person is on the road surface used by vehicles
+- no crosswalk at this place
+negative_cues:
+- crossing on a zebra crossing
+- walking on the sidewalk next to the road
+severity: medium

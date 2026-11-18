@@ -1,0 +1,74 @@
+AERO-MOT: Self-Calibrating Evidential Association and Visual-Kinematic
+Recovery for Aerial Multi-Object Tracking
+Copyright (C) 2026 AERO-MOT Authors
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public
+License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program (see the LICENSE file). If not, see
+<https://www.gnu.org/licenses/>.
+
+-------------------------------------------------------------------------------
+Third-party components
+-------------------------------------------------------------------------------
+
+AERO-MOT incorporates or depends on the following third-party work. Each
+component remains under its original license; the original copyright and
+license notices are retained in the corresponding source files.
+
+1. Ultralytics YOLO -- https://github.com/ultralytics/ultralytics
+   License: AGPL-3.0
+   Used as a runtime dependency (DetectionModel, Conv, C3k2, BboxLoss,
+   v8DetectionLoss, NMS utilities) and as the source of
+   aeromot/cfg/yolo_11.yaml. AERO-MOT is released under AGPL-3.0 to comply
+   with this license.
+
+2. FairMOT -- https://github.com/ifzhang/FairMOT
+   License: MIT
+   aeromot/tracker/fairmot/basetrack.py (adapted BaseTrack state machine).
+
+3. Microsoft -- Fast R-CNN / CenterNet utilities
+   License: MIT, Copyright (c) 2015 Microsoft
+   aeromot/utils/timer.py, aeromot/utils/image.py.
+
+4. RT-DETR -- https://github.com/lyuwenyu/RT-DETR
+   License: Apache-2.0, Copyright (c) 2023 lyuwenyu
+   aeromot/utils/dist.py (itself derived from torchvision reference
+   scripts, BSD-3-Clause, and DETR, Apache-2.0).
+
+5. RF-DETR -- https://github.com/roboflow/rf-detr
+   License: Apache-2.0
+   Warmup + cosine/step learning-rate schedule in aeromot/optim/scheduler.py.
+
+6. TrackEval -- https://github.com/JonathonLuiten/TrackEval
+   License: MIT
+   Optional runtime dependency for HOTA evaluation (aeromot/evaluation/hota.py).
+
+-------------------------------------------------------------------------------
+Port into EdgeStream-VLM (perception/) — changes relative to AERO-MOT
+-------------------------------------------------------------------------------
+* tracker/: copied from aeromot/tracker (FairMOT baseline removed). Changes:
+  - core/tracker.py: VisDrone-specific switches moved to config
+    (minority_large_classes, class_penalty, qam_beta_modulation); the nested
+    O(T*D) `_build_qam_cost` loop replaced by the vectorised
+    `_qam_candidate_cost` (numerically identical, see tests/test_qam_cost.py).
+  - core/base.py + core/tracker.py: the class-level id counter
+    (MCBaseTrack._count_dict) became a per-tracker IdCounter, so several
+    trackers (cameras) in one process no longer share or reset each other's ids.
+  - ops/association_ops.py: cython_bbox is optional; NumPy fallback keeps the
+    same +1-pixel IoU convention.
+* models/detector.py: rewritten inference-only wrapper of YoloFalconModel with
+  strict checkpoint loading and lazy EAD/LQC registration.
+* models/lqc.py: aeromot/nn/modules/latent_query_context.py without the
+  import-time `register_lqc()` call.
+* postprocess.py: aeromot/nn/postprocess/postprocessor.py (unchanged).
+* preprocess.py / perceptor.py: new; preprocessing now matches training
+  (RGB + ImageNet normalisation) and low-score candidates reach the tracker.

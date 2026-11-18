@@ -1,0 +1,12 @@
+id: bicycling
+version: 1
+name: Bicycling
+short: a bicycle is ridden in a pedestrian-only area
+definition: A person rides a bicycle on a footpath, plaza or other pedestrian-only area.
+positive_cues:
+- a bicycle among pedestrians
+- moving faster than walking people on a footpath
+negative_cues:
+- riding on a road or bike lane
+- pushing the bicycle while walking
+severity: low
