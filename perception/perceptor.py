@@ -112,6 +112,29 @@ class Perceptor:
             latency_ms={"preprocess": (t1 - t0) * 1e3, "detector": (t2 - t1) * 1e3,
                         "post+track": (t3 - t2) * 1e3, "total": (t3 - t0) * 1e3})
 
+    @torch.no_grad()
+    def detect(self, frame_bgr: np.ndarray, conf_thres: Optional[float] = None) -> list:
+        """Detector only (no tracker state change): [(tlwh, score, cls_name)] in input-image px.
+        Used for zoom re-detection on crops."""
+        d = self.cfg.detector
+        h, w = frame_bgr.shape[:2]
+        chw, _ = preprocess(frame_bgr, self.net_w, self.net_h, letterbox=d.letterbox)
+        x = to_tensor(chw, self.device, half=d.half and self.device.type == "cuda")
+        out = self.detector(x)
+        res = self.post(out, torch.tensor([[h, w]], device=self.device))[0]
+        names = self.cfg.output.class_names
+        boxes, scores, labels = res.get("boxes"), res.get("scores"), res.get("labels")
+        dets = []
+        if boxes is None or len(boxes) == 0:
+            return dets
+        thr = d.conf_thres if conf_thres is None else conf_thres
+        for b, sc, lb in zip(boxes.float().cpu().numpy(), scores.float().cpu().numpy(), labels.cpu().numpy()):
+            if sc < thr or b[2] <= b[0] or b[3] <= b[1]:
+                continue
+            dets.append((np.array([b[0], b[1], b[2] - b[0], b[3] - b[1]], np.float32), float(sc),
+                         names[int(lb)] if int(lb) < len(names) else str(int(lb))))
+        return dets
+
     # ------------------------------------------------------------------ internals
     @staticmethod
     def _to_tracks(boxes, scores, labels, reid) -> dict:

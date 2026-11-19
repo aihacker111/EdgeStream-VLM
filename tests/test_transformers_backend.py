@@ -40,24 +40,28 @@ def _tiny_qwen3_vl(path):
     proc.save_pretrained(path)
 
 
-def test_transformers_backend_runs_a_vad_request(tmp_path):
+def test_transformers_backend_runs_an_rmot_set_request(tmp_path):
+    """The generic chat() path used by the RMOT verifier: images + text, per-mark P(yes)."""
+    import sys
     from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent))
+    from synthetic_rmot import make_world
 
-    from edgestream.types import Candidate
-    from edgestream.vlm import load_cards
+    from edgestream.rmot.tracklets import GraphConfig, TrackletGraph
+    from edgestream.rmot.verifier import FrameSource, VLMVerifier
     from edgestream.vlm.backends import TransformersBackend
-    from edgestream.vlm.prompt_vad import VADPromptBuilder, load_hypotheses
     try:
         _tiny_qwen3_vl(tmp_path / "m")
-    except Exception as e:                     # API drift across transformers versions
+    except Exception as e:
         pytest.skip(f"cannot build a tiny Qwen3-VL with transformers {transformers.__version__}: {e}")
-    cards = Path(__file__).resolve().parents[1] / "event_cards" / "uav_surveillance"
-    b = TransformersBackend(str(tmp_path / "m"), device="cpu")
-    pb = VADPromptBuilder(load_cards(cards), load_hypotheses(cards), max_new_tokens=8)
-    ctx = {"stats_text": "x", "scene_log": [],
-           "tracks": [{"cls_name": "pedestrian", "trajectory": "fast",
-                       "crops": [(np.zeros((224, 224, 3), np.uint8), (224, 224), 1.0)]}]}
-    req = pb.build(Candidate(1, "running", [1], 0, 3, .8, .8, .5), ctx, np.zeros((360, 640, 3), np.uint8),
-                   [(10, 10, 20, 40)])
-    v = b(req)                                  # random weights: any verdict, but the call must work
-    assert v.verdict in ("yes", "no", "uncertain") and v.prompt_tokens > 100 and v.completion_tokens >= 1
+    perc, aff, _, _ = make_world(0, n=20)
+    g = TrackletGraph(GraphConfig(fps=10.0))
+    frames = FrameSource()
+    for r, fo in enumerate(perc):
+        g.update(r, r / 10.0, fo.tracks, (1280, 720), aff[r])
+        frames.put(r, np.full((720, 1280, 3), 90, np.uint8))
+    grp = [s for s in g.segs.values() if s.obs[0].rank <= 10 <= s.obs[-1].rank][:3]
+    v = VLMVerifier(TransformersBackend(str(tmp_path / "m"), device="cpu"), overview_width=128)
+    ans = v.refer(g, grp, 10, "red cars", frames)
+    assert ans.kind == "refer" and ans.prompt_tokens > 0 and ans.latency_s > 0
+    assert all(0.0 <= p <= 1.0 for p in ans.probs.values())        # random weights: any answers, valid range

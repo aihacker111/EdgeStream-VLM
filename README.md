@@ -17,8 +17,6 @@ Everything runs end to end on a video (`python -m edgestream.run`). Open work is
 configs/perception.yaml     detector + tracker settings
 configs/pipeline.yaml       scene / candidates / gate / memory / VLM / events settings
 event_cards/traffic/        one YAML per event type (definition, cues, hard negatives)
-event_cards/uav_surveillance/  24 VAD categories (A2Seek + UAV traffic) + _hypotheses.yaml
-configs/vad_uav.yaml, vad_cctv.yaml   VAD pipeline settings
 edgestream/                 reasoning pipeline
   harness/                  causal video replay, ring buffer, budget ledger, JSONL logs, perception cache
   scene/                    ego-motion (background LK + RANSAC), flow field, track histories, density
@@ -28,7 +26,7 @@ edgestream/                 reasoning pipeline
   vlm/                      cards, Set-of-Mark prompt builder, backends (openai / transformers / simulated)
   events/                   aggregation, cooldown, evidence clips, routing
   pipeline.py, run.py       orchestration + CLI
-  vad/                      VAD: normality models, pixel cues, frame scorer, metrics, loaders, pipeline, CLI
+  rmot/                     online aerial referring MOT ("search, don't filter"), see below
 perception/                 detector (YOLO11s-P2) + AERO-MOT tracker, ported
   perceptor.py              Perceptor: frame -> FrameOutput (the only API downstream uses)
   types.py                  TrackOutput / FrameOutput contracts
@@ -38,78 +36,99 @@ perception/                 detector (YOLO11s-P2) + AERO-MOT tracker, ported
   models/                   detector wrapper, ReID head, EAD/LQC modules, YAMLs
   tracker/                  SPEAR + QAM tracker (from AERO-MOT)
   cli.py                    run on a video / frame folder
-tests/                      pytest (port parity, preprocessing, end-to-end, VAD)
-scripts/                    vad_benchmark.py, fit_normal_bank.py, synthetic_demo.py
+tests/                      pytest (port parity, preprocessing, end-to-end, RMOT)
+scripts/                    rmot_benchmark.py, run_benchmarks.sh, datasets/fetch.py, synthetic_demo.py
 weights/                    checkpoints (not tracked by git)
 ```
 
-## Video anomaly detection (UAV focus)
+## Online aerial referring MOT — "search, don't filter" (main direction)
 
-Streaming, object-centric, budgeted VLM anomaly detection. Same perception and budget machinery as the
-traffic pipeline; the cheap tier proposes *object-level hypotheses*, the VLM verifies them open-set, and
-object beliefs are turned into the frame scores that VAD benchmarks evaluate.
+Task: while the drone flies, output the boxes and identities of every object that matches a
+natural-language query ("white cars moving opposite to us"), with a bounded commit lag L.
+
+Existing MLLM RMOT pipelines *filter*: each candidate track is accepted or rejected on its own
+(YesTrack: per-candidate yes/no on keyframes; VMRMOT: motion turned into text). Identity errors of
+the tracker are inherited, temporal validity is ignored, and every decision is final. Here the
+referring decision and the association are **one joint inference** over a hypothesis graph,
+re-solved on a receding horizon:
 
 ```
-frames ─(stride)─► perception ─► scene (ego-motion) ─► cheap tier ───────────────► priority ─► VOI gate ─► VLM ─► beliefs ─► frame scores
-                                                       human rules: running, falling,              (token      (open-set:  (product   online (causal)
-                                                         lying_still, loitering,                    bucket,      taxonomy    of experts  offline (protocol)
-                                                         close_interaction, crowd_change            density)     prefix +    with the    A2Seek answers
-                                                       normality: location rarity (Poisson,                       hypothesis  cheap tier)
-                                                         ego-stabilised), kinematic k-NN bank                     cards)
-                                                       pixels: residual motion, static change
+frames ─► AERO-MOT tracks + background affine (ego motion)
+       ─► tracklet hypothesis graph: tracks cut early into ≤1 s pieces; cont / stitch link hypotheses
+       ─► provisional prior: class family + measured kinematics (moving, turning, same/opposite to the drone)
+       ─► deadline-aware scheduler ─► async VLM pool (vLLM, n_workers)
+             set-level comparative prompt:  [overview with marks | close-up gallery | measured facts | EXPRESSION]
+             pairwise link prompt for uncertain stitches
+       ─► window solver every 0.5 s (CP-SAT): labels + links jointly, frozen committed boundary
+       ─► commit frames older than t − L (+ stitched-gap interpolation, zoom re-detection)
 ```
 
-| Component | File | Idea |
-|---|---|---|
-| Object rules | `edgestream/candidates/objects.py` | scale-free thresholds (object sizes/s); walking speed and body shape of people learned online from the scene |
-| Location rarity | `edgestream/vad/normality.py` `ClassLocationMap` | Poisson rate per cell and class in drift-compensated coordinates, Gamma prior at the global rate, own counts removed: "a pedestrian where in 2 min nobody walked" |
-| Kinematic bank | `KinematicBank` | k-NN in robust-standardised motion space, unit = 95th-percentile leave-one-out distance of normal samples; self-gated insertion; persistence filter; warm start from normal videos |
-| Pixel cues | `edgestream/vad/residual.py` | residual motion after camera compensation outside every box (animals, objects the detector does not know); dual-background static change (lost item, litter) |
-| VOI gate | `edgestream/gate/gate.py` | order by p·severity·uncertainty/cost; re-ask only uncertain answers or a "no" whose evidence grew |
-| Object-level sharing | `edgestream/vad/pipeline.py` | one VLM answer settles every hypothesis on the same object; new hypotheses on a verified object inherit it |
-| Open-set prompt | `edgestream/vlm/prompt_vad.py` | fixed taxonomy prefix (KV-cacheable) + 1-3 cards chosen by the hypothesis (class-aware); answer can be any category, other_anomaly or normal |
-| Frame scorer | `edgestream/vad/scorer.py` | b = σ(logit p_vlm + η logit q); unverified capped at w_u·q; attack/release filter; online scores respect VLM latency, offline scores are the usual protocol |
-| Metrics / loaders | `edgestream/vad/metrics.py`, `datasets.py` | micro/macro AUC, AP, AUC on abnormal videos, EER; UCF-Crime, XD-Violence, A2Seek (+ answers in A2Seek's own format), generic frame labels |
+* **One joint objective.** `max Σ n_i(z_i − τ)y_i + κΣ l_e x_e − λΣ|y_i − y_j|x_e` with flow constraints
+  (`edgestream/rmot/solver.py`). A wrong VLM answer inside a confident chain is out-voted; a
+  fragmented track is re-joined when the stitch evidence and the referring evidence agree.
+* **Commit at t − L; offline = L = ∞.** Committed frames are never re-written, but committed pieces
+  stay in the window as variables so their evidence keeps flowing to new pieces ("frozen outputs,
+  live beliefs"). HOTA@L for L ∈ {0, 2, 5, ∞} is the main result curve.
+* **Set-level comparative verifier.** One call judges 8 candidates at once (P(yes) per mark from the
+  token logprobs) and can resolve relative expressions. The expression is the LAST part of the
+  prompt and group composition never depends on the expression, so vLLM's prefix cache serves
+  all queries of a video from the same KV prefix.
+* **Deadline-aware scheduling.** value = Σ 4p(1−p) × frames still uncommitted at completion / (1+answers),
+  divided by the time left before the first deadline; requests that cannot finish in time are worth 0.
+* **Test-time scaling knobs**: K answers per piece, R partitions per anchor (`rounds`), group size.
+* **Measured kinematics in ego-stabilised coordinates**: a single frame cannot tell "parked" from
+  "waiting at a light" or "same direction as us" from a moving drone; these are measured and given
+  to the VLM as facts (and used for the provisional prior).
+
+### Benchmarks (official protocols)
+
+| dataset | role | split | metric |
+|---|---|---|---|
+| AerialMind (AAAI 2026) | primary, UAV | in-domain: 17 VisDrone test sequences (4,986 rows); cross-domain: 13 UAVDT sequences (3,415 rows) | HOTA / DetA / AssA / LocA |
+| Refer-KITTI-V2 | generality, ground vehicle | 0005, 0011, 0013, 0019 (861 rows) | same |
+
+`edgestream/rmot/hota.py` is a port of TrackEval's HOTA and of the RMOT fork's folder layout
+(`<method>/<video>/<expression>/{gt.txt,predict.txt}`, frames 1..N, one sequence per
+`video+expression` row). `tests/test_rmot.py` checks it against TrackEval's own code;
+`--verify-trackeval PATH` repeats the check on every evaluated sequence. Leakage: AERO-MOT was
+trained on VisDrone2019-MOT train (val for validation); AerialMind's in-domain test set is
+VisDrone test-dev and its cross-domain set is UAVDT, neither seen by the detector.
+
+### Baselines (same perception, prompts, VLM pool and lag rule)
+
+| name | what |
+|---|---|
+| `filter_kf` | YesTrack-style keyframe filter: per-candidate yes/no, track keeps its last answer (nearest answer when L = ∞) |
+| `filter_ef` | every-frame filter (keyframe_every 1) |
+| `filter_set` | keyframe filter with set prompts and facts (verifier without search) |
+| `prior` | no VLM: class family + kinematics |
+| `search_single`, `search_nolink` | ablations: single-candidate prompts / no stitching |
+| `ceiling` | the method with a ground-truth verifier: perception ceiling, never reported as a result |
+
+Online, every method gets the same VLM throughput (n_workers × latency), so they are matched in
+VLM time; offline, `--match-compute` caps each baseline at the calls the method used on that stream.
+
+### Run
 
 ```bash
-# one video
-python -m edgestream.vad.run --video clip.mp4 --config configs/vad_uav.yaml --vlm openai --save-video --out runs/vad_demo
-
-# warm-start the motion bank from normal training videos (optional)
-python scripts/fit_normal_bank.py --videos data/UIT-ADrone/train/videos --out runs/banks/uit.npz
-
-# benchmark + budget sweep (perception is cached after the first pass)
-python scripts/vad_benchmark.py --dataset generic --videos data/UIT-ADrone/test/videos \
-    --labels data/UIT-ADrone/test/labels --fps 30 --budgets 0 2 6 12 --vlm openai --out runs/bench_uit
-python scripts/vad_benchmark.py --dataset ucf_crime --videos data/UCF_Crimes/Videos \
-    --annotations data/UCF_Crimes/Temporal_Anomaly_Annotation_for_Testing_Videos.txt \
-    --config configs/vad_cctv.yaml --stride 2 --budgets 0 6 --out runs/bench_ucf
-python scripts/vad_benchmark.py --dataset a2seek --a2seek-samples data/A2Seek/dataset/cot_single/test.jsonl \
-    --videos "data/A2Seek-Videos/{g_id}/{v_id}.mp4" --out runs/bench_a2seek
-#   -> runs/bench_a2seek/budget_6/a2seek_predictions.jsonl works with A2Seek's scripts/evaluate.py
+pip install -e ".[rmot]"                                   # ortools (CP-SAT)
+python scripts/datasets/fetch.py aerialmind --out data/AerialMind        # HF + official seqmaps
+vllm serve Qwen/Qwen3-VL-4B-Instruct --enable-prefix-caching --max-model-len 8192 \
+     --gpu-memory-utilization 0.90 --limit-mm-per-prompt '{"image": 4}' --port 8000      # one 24 GB GPU
+python scripts/rmot_benchmark.py --dataset aerialmind --root data/AerialMind --split in_domain \
+     --seqmap data/AerialMind/seqmap.txt --methods search,filter_kf,filter_ef,prior --lags 0,2,5,inf \
+     --vlm openai --vlm-url http://localhost:8000/v1 --n-workers 4 --match-compute --out runs/rmot_am_id
+# or everything (both AerialMind splits + Refer-KITTI-V2), download included:
+RMOT_VLM=openai bash scripts/run_benchmarks.sh rmot
+# quick plumbing check without a VLM (ground-truth oracle, NOT a result):
+RMOT_VLM=oracle MAX_VIDEOS=1 MAX_EXPR=3 bash scripts/run_benchmarks.sh --bench-only aerialmind
 ```
 
-**All benchmarks in one go** — download, convert labels, warm-start the motion bank, budget sweep, A2Seek's
-official evaluator, summary table:
-
-```bash
-ollama serve & ollama pull qwen3-vl:4b                       # or a vLLM server (VLM_URL=...)
-bash scripts/run_benchmarks.sh --smoke a2seek                # quick check: 3 videos, 300 frames
-bash scripts/run_benchmarks.sh all                           # a2seek uit_adrone drone_anomaly muvad ucf_crime xd_violence
-VLM=oracle BUDGETS="0 2 6 12" bash scripts/run_benchmarks.sh --bench-only uit_adrone   # upper bound
-```
-
-Results: `runs/bench_<date>/<dataset>/metrics.json`, `budget_curve.csv`, `summary.md`. Drone-Anomaly (OneDrive) must
-be downloaded by hand into `data/Drone-Anomaly`; MUVAD is not released yet; UIT-ADrone comes from Google Drive
-(gdown; download by hand if Drive refuses). Per-step tools: `scripts/datasets/fetch.py --help`.
-
-VLM backends: `openai` (Ollama/vLLM, real), `transformers` (real), `oracle` (answers from the ground-truth
-labels with a set accuracy: upper bound that isolates gate/memory/budget from VLM quality), `simulated`
-(echoes the cheap tier: plumbing only, never report its numbers).
-
-Notes: A2Seek's `f_id` -> video frame mapping must be checked on your copy of A2Seek-Videos
-(`--a2seek-frame-scale`). The kinematic bank transfers across scenes; location statistics never do (they
-are always learned online). Budget 0 = cheap tier only (the ablation baseline).
+Perception runs once per video and is cached (`<out>/../perception_cache/<dataset>/<video>/`,
+tracks + ReID embeddings + ego affine). VLM answers are cached by exact prompt content
+(`<out>/vlm_cache_<backend>.jsonl`), so the lag sweep and the ablations re-use them; the stored
+latency is replayed, so the logical clock is unchanged. `--tracks-dir` runs everything on an
+external tracker's MOT files instead (perception-matched comparison with other papers).
 
 ## Install
 

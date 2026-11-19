@@ -5,30 +5,31 @@ Ký hiệu: `[x]` xong · `[ ]` chưa · ⭐ = đóng góp chính của paper.
 
 ---
 
-## V. ⭐ Hướng mới: Video Anomaly Detection (UAV là chính, CCTV phụ)
+## R. ⭐⭐ Hướng chính: Online aerial RMOT — "search, don't filter" (ICCV 2027)
 
-- [x] Ứng viên theo đối tượng: running, falling, lying_still, loitering, close_interaction, crowd_change (ngưỡng theo "kích thước vật", tốc độ đi bộ và dáng người học online từ cảnh)
-- [x] Mô hình "bình thường" online: độ hiếm vị trí theo lớp (Poisson, tọa độ đã bù trôi của drone) + kho k-NN đặc trưng chuyển động (tự lọc, lọc tồn tại 3 cửa sổ, khởi động ấm từ video bình thường)
-- [x] Tín hiệu pixel: chuyển động dư ngoài mọi box (con vật, vật detector không biết), thay đổi tĩnh (đồ bỏ quên, xả rác)
-- [x] Gate VOI: p × severity × độ bất định / chi phí; chỉ hỏi lại khi câu trả lời trước còn mơ hồ
-- [x] Chia sẻ xác minh theo đối tượng: một câu trả lời VLM dùng cho mọi giả thuyết trên cùng đối tượng
-- [x] Prompt open-set: tiền tố taxonomy cố định (cache được) + 1–3 card theo giả thuyết (theo lớp)
-- [x] 24 event card `event_cards/uav_surveillance/` (20 lớp A2Seek + wrong_way, vehicle_on_walkway, illegal_parking, other_anomaly)
-- [x] Điểm theo frame: online (nhân quả, tính cả độ trễ VLM) và offline (giao thức chuẩn); trả lời A2Seek đúng định dạng
-- [x] Metric: micro/macro AUC, AP, AUC_A, EER (khớp sklearn); loader UCF-Crime, XD-Violence, A2Seek, generic
-- [x] `scripts/vad_benchmark.py` (sweep ngân sách, cache perception), `scripts/fit_normal_bank.py`, `python -m edgestream.vad.run`
-- [x] Backend `oracle` để tách ảnh hưởng của gate/bộ nhớ khỏi chất lượng VLM
-- [x] Test tổng hợp: 3 sự kiện (chạy, ngã, giẫm cỏ) — offline AUC ≈ 0,95, online ≈ 0,77; cảnh bình thường không có sự kiện
-- [x] `scripts/run_benchmarks.sh` + `scripts/datasets/fetch.py`: tải A2Seek (+ video của tập test), XD-Violence, UCF-Crime (mirror HF), UIT-ADrone (gdown); chuyển nhãn UIT-ADrone/Drone-Anomaly/MUVAD sang `labels/<video>.npy`; fit bank; sweep ngân sách; chấm A2Seek bằng `evaluate.py` chính thức
-- [ ] **Chạy thật** `bash scripts/run_benchmarks.sh all` trên máy; tải Drone-Anomaly thủ công (OneDrive); chờ MUVAD công bố
-- [ ] Kiểm tra lại cách ghép nhãn–video của UIT-ADrone sau khi tải (script ghép theo tên, nếu không khớp thì theo thứ tự)
-- [ ] Kiểm tra ánh xạ `f_id` → frame video của A2Seek: script tự ước lượng bằng cách so ảnh mẫu với frame video (xem dòng "frame scale check" trong log)
-- [ ] Chạy với VLM thật (Ollama `qwen3-vl:4b` / vLLM Qwen3-VL-8B); so sánh với oracle để biết khoảng cách do VLM
-- [ ] Hiệu chỉnh `w_unverified`, `w_dense`, `knn_ratio`, `rarity_nats` trên tập val (hiện đặt tay; trên video cao tốc bình thường điểm trung vị ≈ 0,4–0,6 với simulated — cần VLM thật kéo xuống)
-- [ ] Học trọng số priority từ nhãn (`PriorityModel.fit`)
-- [ ] Bảng chính: AUC/AP theo ngân sách (0, 2, 6, 12 lượt/phút) so với LAVAD, AnomalyRuler, VERA, Holmes-VAU, A2Seek-R1, các phương pháp UAV
-- [ ] Ablation: bỏ từng nhánh ứng viên, bỏ VOI, bỏ chia sẻ theo đối tượng, bỏ bù trôi drone, bỏ kho k-NN ấm
-- [ ] Đo độ trễ cảnh báo (online) — điểm mạnh so với các phương pháp offline
+Đã làm (code + test, chạy được end-to-end):
+- [x] `edgestream/rmot/hota.py`: HOTA/DetA/AssA/LocA port từ TrackEval (khớp 0.0 trên dữ liệu ngẫu nhiên), combine kiểu TrackEval, layout RMOT `<video>/<expr>/{gt,predict}.txt`
+- [x] `datasets.py`: AerialMind (in/cross-domain, seqmap chính thức, expression_id = tên file, không dedup), Refer-KITTI(-V2); `check_label_format` đo x1y1wh vs cxcywh
+- [x] `expression.py`: lọc họ lớp + vị từ động học (moving/parked, turning, same/opposite với drone, left→right) + phần "không đo được"
+- [x] `tracklets.py`: đồ thị giả thuyết tăng dần, cắt sớm (≤1 s, recovered, jump, appearance, class), cạnh cont/stitch có gate chuyển động bù ego + ReID
+- [x] `verifier.py`: prompt set-level so sánh (expression cuối, nhóm độc lập expression → prefix cache), prompt link, prompt đơn (baseline), Oracle, cache trả lời chính xác
+- [x] `scheduler.py`: pool VLM bất đồng bộ trên logical clock, giá trị = bất định × frame chưa commit / thời gian còn lại
+- [x] `solver.py`: CP-SAT theo thành phần liên thông + fallback greedy/Viterbi; "frozen outputs, live beliefs"
+- [x] `pipeline.py`: OnlineRMOT (commit t−L, L=∞ offline drain), baselines filter_kf/filter_ef/filter_set/prior, zoom re-detection, nội suy gap
+- [x] `scripts/rmot_benchmark.py` (HOTA@L, compute-matched, `--verify-trackeval`), `fetch.py aerialmind|refer-kitti-v2`, `run_benchmarks.sh rmot`
+
+Việc tiếp theo (theo thứ tự):
+- [ ] Tải AerialMind thật; chạy `check_label_format` trên UAVDT (cxcywh?) và kiểm tra frame key (VisDrone 1-based) bằng cách vẽ GT
+- [ ] Đối chiếu với TrackEval fork chính thức trên 1 video (nó hard-code đường dẫn ảnh để lấy độ dài sequence)
+- [ ] Chạy `ceiling` (GT verifier) → biết trần của perception AERO-MOT trên AerialMind; nếu DetA thấp → bật zoom, hạ conf_thres
+- [ ] Chạy thật Qwen3-VL-4B (vLLM, 4 workers) trên in-domain với MAX_EXPR nhỏ; đo latency thật, tỉ lệ cache hit prefix
+- [ ] Hiệu chỉnh: tau, lam, kappa, unverified_w, group_size, K, R trên tập *train* của AerialMind (không dùng test)
+- [ ] Bảng chính: HOTA@L (L=0,2,5,∞) cho search vs filter_kf vs filter_ef (cùng thông lượng VLM); so với HETrack 31.46 (offline)
+- [ ] Ablation: search_single (set-level có ích?), search_nolink (stitching), không facts, R/K scaling curve
+- [ ] Refer-KITTI-V2 với tracks bên ngoài (`--tracks-dir`) vì AERO-MOT train trên VisDrone
+- [ ] (tuỳ) GRPO + LoRA cho Qwen3-VL-4B trên câu hỏi set-level từ tập train
+
+---
 
 ## M0. Perception (port từ AERO-MOT)
 
@@ -54,7 +55,6 @@ Ký hiệu: `[x]` xong · `[ ]` chưa · ⭐ = đóng góp chính của paper.
 - [x] `edgestream/harness/logger.py`: JSONL cho scene, candidates, gate, vlm_calls, events, route_*
 - [x] `edgestream/harness/perception_cache.py`: phát lại `tracks.jsonl` để sweep ngân sách mà không chạy lại detector
 - [ ] `data/schema.py`: `Stream`, `EventGT(t_start, t_end, type, track_hint?)`
-- [ ] Converter: UIT-ADrone, Drone-Anomaly, MUVAD (UAV); AI City 2026 TAR, ACCIDENT, UCA (mặt đất); tập con OVO-Bench
 - [ ] `eval/`: ghép theo temporal IoU ≥ 0,3; F1 theo loại, độ trễ cảnh báo, báo động giả/giờ; chia theo mật độ; vẽ đường cong theo ngân sách
 - [ ] Sweep script: lưới B_call × B_mem × B_out chạy trên perception cache
 
@@ -99,7 +99,6 @@ Ký hiệu: `[x]` xong · `[ ]` chưa · ⭐ = đóng góp chính của paper.
 - [x] Parser JSON chịu lỗi; độ tin cậy từ logprob
 - [ ] **Chạy với VLM thật** (Ollama `qwen3-vl:4b` trên Mac, hoặc vLLM trên GPU) — chưa làm được trong môi trường của tôi vì không tải được trọng số
 - [ ] Đo prefix caching (vLLM `--enable-prefix-caching`)
-- [x] Event card cho UAV và giám sát chung (`event_cards/uav_surveillance/`)
 
 ## M7. Gộp sự kiện + đầu ra
 

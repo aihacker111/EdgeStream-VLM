@@ -105,7 +105,7 @@ class GateConfig:
     resend_after_s: float = 8.0  # re-verify an open candidate only after this long ...
     resend_delta_p: float = 0.15  # ... or when its priority rose by this much
     max_sends: int = 2           # per candidate
-    voi: bool = False            # value-of-information ordering / re-verification (VAD mode)
+    voi: bool = False            # value-of-information ordering / re-verification
     voi_resend_uncertainty: float = 0.5   # re-verify only if the last answer was this uncertain
 
 

@@ -1,0 +1,70 @@
+# Refer-KITTI-V2 (generality check, ground vehicle camera).
+# Paths are relative to the project root. Every key maps to RMOTConfig / its sub-configs
+# (edgestream/rmot/pipeline.py, tracklets.py, solver.py, scheduler.py, zoom.py).
+
+perception_config: configs/perception.yaml
+fps: 10                         # KITTI frame rate
+stride: 1                       # process every frame (GT is per frame)
+
+rmot:
+  lag_s: 2.0                    # commit lag L (overridden by --lags); inf = offline
+  window_s: 12.0                # solver window W
+  reopt_s: 0.5                  # re-optimise every 0.5 s
+  group_size: 8                 # candidates per set-level prompt
+  rounds: 2                     # R: partitions per anchor (each candidate compared with different neighbours)
+  k_answers: 2                  # K: answers wanted per piece
+  anchor_s: 0.5
+  min_ask_s: 0.3
+  link_verify: true
+  link_band: [0.15, 0.85]
+  prior_base: -1.0
+  class_mismatch: -8.0
+  kin_weight: 1.0
+  unmeasured_cap: -0.5
+  clip_weight: 0.0              # >0 needs --clip-model
+  interp_max_s: 2.0
+  zoom: true
+  # filter baselines
+  keyframe_every: 4             # YesTrack-style keyframe interval in frames
+  filter_prompt: single
+  filter_facts: false
+  graph:
+    max_len_s: 1.0
+    min_len_s: 0.2
+    end_after_s: 0.5
+    stitch_gap_s: 3.0
+    stitch_gate: 2.5
+    moving_bl_s: 0.35
+  solver:
+    tau: 0.0
+    lam: 1.0
+    kappa: 0.5
+    time_limit_s: 0.2
+    unverified_w: 0.3
+    future_s: 1.0
+  sched:
+    n_workers: 4                # concurrent requests on one vLLM server (24 GB, Qwen3-VL-4B)
+    latency_scale: 1.0          # measured latency of a sequential call -> logical latency
+    fixed_latency_s: null
+    eps_s: 0.25
+  zoom_cfg:
+    context: 3.0
+    min_crop: 160
+    min_iou: 0.3
+    conf_thres: 0.25
+
+vlm:
+  backend: openai               # openai (vLLM/SGLang server) | transformers | oracle
+  overview_width: 1280
+  facts: true
+  openai:
+    base_url: http://localhost:8000/v1
+    model: Qwen/Qwen3-VL-4B-Instruct
+    timeout_s: 120
+  transformers:
+    model_id: Qwen/Qwen3-VL-4B-Instruct
+    device: auto
+    dtype: auto
+  oracle:                       # NOT a VLM: GT answers with errors (plumbing / ceiling only)
+    acc: 0.9
+    conf: 0.85

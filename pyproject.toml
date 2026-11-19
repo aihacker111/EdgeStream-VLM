@@ -24,6 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 fast = ["cython-bbox>=0.1.3"]      # faster IoU; a NumPy fallback with identical numbers is built in
+rmot = ["ortools>=9.10"]          # exact window solver (CP-SAT); greedy + Viterbi fallback without it
 dev = ["pytest>=7"]
 
 [tool.setuptools.packages.find]

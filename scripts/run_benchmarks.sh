@@ -1,40 +1,35 @@
 #!/usr/bin/env bash
 # =====================================================================================
-#  EdgeStream-VLM — tải dữ liệu + chạy benchmark VAD cho từng bộ dữ liệu
+#  EdgeStream-VLM — tải dữ liệu + chạy benchmark referring MOT (HOTA@L)
 #
 #  Cách dùng:
-#    bash scripts/run_benchmarks.sh                      # tất cả các bộ
-#    bash scripts/run_benchmarks.sh a2seek uit_adrone    # chỉ vài bộ
-#    bash scripts/run_benchmarks.sh --download-only xd_violence
-#    bash scripts/run_benchmarks.sh --bench-only ucf_crime
-#    bash scripts/run_benchmarks.sh --smoke all          # chạy thử nhanh (3 video, 300 frame)
+#    bash scripts/run_benchmarks.sh                      # tất cả: aerialmind + refer_kitti_v2
+#    bash scripts/run_benchmarks.sh aerialmind           # chỉ AerialMind (in-domain + cross-domain)
+#    bash scripts/run_benchmarks.sh --download-only
+#    bash scripts/run_benchmarks.sh --bench-only aerialmind
+#    bash scripts/run_benchmarks.sh --smoke aerialmind   # chạy thử nhanh (3 video, 3 expression/video)
 #
-#  Các bộ: a2seek  uit_adrone  drone_anomaly  muvad  ucf_crime  xd_violence
+#  Các bộ: aerialmind (chính, UAV, giao thức chính thức)   refer_kitti_v2 (tổng quát, camera xe)
 #
-#  Tùy chỉnh bằng biến môi trường, ví dụ:
-#    VLM_MODEL=Qwen/Qwen3-VL-4B-Instruct BUDGETS="0 2 6 12" STRIDE=2 bash scripts/run_benchmarks.sh a2seek
-#
+#  Biến môi trường:
 #    DATA_DIR      nơi chứa dữ liệu                      (mặc định: data)
 #    RUN_DIR       nơi ghi kết quả                       (mặc định: runs/bench_<ngày giờ>)
-#    VLM           transformers | openai | oracle | simulated
-#                  (mặc định: transformers = model Hugging Face chạy trực tiếp trên máy, không cần server)
-#    VLM_MODEL     transformers: id trên Hugging Face    (mặc định: Qwen/Qwen3-VL-2B-Instruct)
-#                  openai: tên model trên server         (mặc định: qwen3-vl:4b)
-#    VLM_URL       chỉ cho openai: OpenAI-compatible endpoint (mặc định: http://localhost:11434/v1 = Ollama)
-#    BUDGETS       số lượt gọi VLM / phút cần quét       (mặc định: "0 2 6 12"; 0 = chỉ tầng rẻ)
-#    STRIDE        xử lý 1 trên k frame                  (mặc định: 1 cho UAV, 2 cho CCTV 30 fps)
-#    MAX_VIDEOS    giới hạn số video mỗi bộ (debug)      (mặc định: không giới hạn)
-#    MAX_FRAMES    giới hạn số frame mỗi video (debug)
-#    FIT_BANK      1 = khởi động ấm kho chuyển động từ video bình thường của tập train (mặc định: 1)
-#    UCF_TRAIN_NORMAL 1 = tải thêm 38 GB video bình thường của UCF-Crime để fit bank (mặc định: 0)
-#    KEEP_ZIPS     1 = giữ file zip sau khi giải nén     (mặc định: 0)
+#    RMOT_METHODS  các phương pháp  (mặc định: search,filter_kf,filter_ef,prior)
+#                  thêm: search_single search_nolink filter_set ceiling
+#    LAGS          độ trễ commit L (giây)                 (mặc định: "0,2,5,inf")
+#    RMOT_VLM      openai | transformers | oracle          (mặc định: openai = server vLLM)
+#    RMOT_VLM_MODEL                                        (mặc định: Qwen/Qwen3-VL-4B-Instruct)
+#    RMOT_VLM_URL  endpoint vLLM                           (mặc định: http://localhost:8000/v1)
+#    N_WORKERS     số request VLM song song                (mặc định: 4)
+#    JOBS          số process chạy song song các stream    (mặc định: 1; >1 chỉ với openai/oracle)
+#    MAX_VIDEOS    giới hạn số video mỗi split (debug)
+#    MAX_EXPR      số expression mỗi video (debug)
+#    AM_SPLITS     "in_domain cross_domain"
 #    PYTHON        trình thông dịch Python               (mặc định: python3)
 #    PARALLEL      1 = tải các bộ song song (chỉ với --download-only)        (mặc định: 1)
-#    RCLONE_REMOTE tên remote Google Drive của rclone cho UIT-ADrone        (mặc định: gdrive)
+#    RCLONE_REMOTE remote Google Drive của rclone cho Refer-KITTI-V2         (mặc định: gdrive)
 #
-#  Dung lượng ước tính: A2Seek ~vài GB (+ video test), UIT-ADrone ~(Drive), Drone-Anomaly ~vài GB,
-#  UCF-Crime ~30 GB (test) / +38 GB (train normal), XD-Violence test ~800 video.
-#  Kết quả: $RUN_DIR/<bộ dữ liệu>/metrics.json, budget_curve.csv và $RUN_DIR/summary.md
+#  Kết quả: $RUN_DIR/<bộ>_<split>/{summary.md,results.json,<method>_L<lag>/...} và $RUN_DIR/summary.md
 # =====================================================================================
 set -Eeuo pipefail
 
@@ -44,16 +39,17 @@ cd "$ROOT"
 PYTHON="${PYTHON:-python3}"
 DATA_DIR="${DATA_DIR:-data}"
 RUN_DIR="${RUN_DIR:-runs/bench_$(date +%Y%m%d_%H%M)}"
-VLM="${VLM:-transformers}"
-VLM_URL="${VLM_URL:-http://localhost:11434/v1}"
-if [ "$VLM" = openai ]; then VLM_MODEL="${VLM_MODEL:-qwen3-vl:4b}"; else VLM_MODEL="${VLM_MODEL:-Qwen/Qwen3-VL-2B-Instruct}"; fi
-BUDGETS="${BUDGETS:-0 2 6 12}"
-FIT_BANK="${FIT_BANK:-1}"
-UCF_TRAIN_NORMAL="${UCF_TRAIN_NORMAL:-0}"
-KEEP_ZIPS="${KEEP_ZIPS:-0}"
 MAX_VIDEOS="${MAX_VIDEOS:-}"
-MAX_FRAMES="${MAX_FRAMES:-}"
 PARALLEL="${PARALLEL:-1}"
+RMOT_METHODS="${RMOT_METHODS:-search,filter_kf,filter_ef,prior}"
+LAGS="${LAGS:-0,2,5,inf}"
+RMOT_VLM="${RMOT_VLM:-openai}"
+RMOT_VLM_MODEL="${RMOT_VLM_MODEL:-Qwen/Qwen3-VL-4B-Instruct}"
+RMOT_VLM_URL="${RMOT_VLM_URL:-http://localhost:8000/v1}"
+N_WORKERS="${N_WORKERS:-4}"
+JOBS="${JOBS:-1}"
+MAX_EXPR="${MAX_EXPR:-}"
+AM_SPLITS="${AM_SPLITS:-in_domain cross_domain}"
 export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"   # tải Hugging Face nhiều luồng
 
 DO_DOWNLOAD=1
@@ -63,14 +59,14 @@ for arg in "$@"; do
   case "$arg" in
     --download-only) DO_BENCH=0 ;;
     --bench-only)    DO_DOWNLOAD=0 ;;
-    --smoke)         MAX_VIDEOS="${MAX_VIDEOS:-3}"; MAX_FRAMES="${MAX_FRAMES:-300}"; BUDGETS="${BUDGETS_SMOKE:-0 6}" ;;
-    -h|--help)       sed -n '2,36p' "$0"; exit 0 ;;
-    all)             DATASETS+=(a2seek uit_adrone drone_anomaly muvad ucf_crime xd_violence) ;;
-    a2seek|uit_adrone|drone_anomaly|muvad|ucf_crime|xd_violence) DATASETS+=("$arg") ;;
+    --smoke)         MAX_VIDEOS="${MAX_VIDEOS:-3}"; MAX_EXPR="${MAX_EXPR:-3}" ;;
+    -h|--help)       sed -n '2,32p' "$0"; exit 0 ;;
+    all|rmot)        DATASETS+=(aerialmind refer_kitti_v2) ;;
+    aerialmind|refer_kitti_v2) DATASETS+=("$arg") ;;
     *) echo "Không hiểu tham số: $arg (xem --help)"; exit 2 ;;
   esac
 done
-[ ${#DATASETS[@]} -eq 0 ] && DATASETS=(a2seek uit_adrone drone_anomaly muvad ucf_crime xd_violence)
+[ ${#DATASETS[@]} -eq 0 ] && DATASETS=(aerialmind refer_kitti_v2)
 
 mkdir -p "$DATA_DIR" "$RUN_DIR"
 LOG="$RUN_DIR/run.log"
@@ -94,7 +90,9 @@ setup() {
     c_info "Chưa cài dự án vào môi trường này -> pip install -e .  (lần đầu mất vài phút: torch, ultralytics)"
     "$PYTHON" -m pip install -e . || { c_err "pip install -e . thất bại (xem lỗi phía trên)"; exit 1; }
   fi
-  "$PYTHON" -m pip install -q -U "huggingface_hub[hf_xet]>=0.32" gdown pyarrow pillow >/dev/null
+  "$PYTHON" -m pip install -q -U "huggingface_hub[hf_xet]>=0.32" gdown pillow >/dev/null
+  "$PYTHON" -c "import ortools" 2>/dev/null || "$PYTHON" -m pip install -q "ortools>=9.10" >/dev/null || \
+    c_warn "ortools chưa cài được: solver dùng greedy + Viterbi thay cho CP-SAT"
   if [ "$DO_BENCH" = 1 ] && [ ! -f weights/falcon_yolo_lqcv2_baseline_jde_mot.pth ]; then
     if [ -f "$HOME/Downloads/falcon_yolo_lqcv2_baseline_jde_mot.pth" ]; then
       c_info "Chép checkpoint từ ~/Downloads vào weights/"
@@ -103,10 +101,10 @@ setup() {
       c_err "Thiếu weights/falcon_yolo_lqcv2_baseline_jde_mot.pth (checkpoint MOT 960x544 của AERO-MOT)"; exit 1
     fi
   fi
-  if [ "$DO_BENCH" = 1 ] && [ "$VLM" = transformers ]; then
+  if [ "$DO_BENCH" = 1 ] && [ "$RMOT_VLM" = transformers ]; then
     "$PYTHON" -m pip install -q -U "transformers>=4.57" accelerate >/dev/null
-    c_info "Tải model $VLM_MODEL từ Hugging Face (lần đầu; 2B ≈ 4–5 GB, 4B ≈ 9 GB, 8B ≈ 17 GB)"
-    "$PYTHON" - "$VLM_MODEL" <<'PY'
+    c_info "Tải model $RMOT_VLM_MODEL từ Hugging Face (lần đầu; 4B ≈ 9 GB, 8B ≈ 17 GB)"
+    "$PYTHON" - "$RMOT_VLM_MODEL" <<'PY'
 import sys, torch
 from huggingface_hub import snapshot_download
 snapshot_download(sys.argv[1], allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja"], max_workers=16)
@@ -116,189 +114,68 @@ if dev == "cpu":
     print("[vlm] WARNING: no GPU/MPS — each VLM call will take tens of seconds")
 PY
   fi
-  if [ "$DO_BENCH" = 1 ] && [ "$VLM" = openai ]; then
-    if curl -sf "${VLM_URL%/v1}/api/tags" >/dev/null 2>&1; then
-      # Ollama: kéo model nếu chưa có
-      if command -v ollama >/dev/null && ! ollama list 2>/dev/null | grep -q "^${VLM_MODEL}"; then
-        c_info "ollama pull $VLM_MODEL"; ollama pull "$VLM_MODEL"
-      fi
-      c_ok "VLM server sẵn sàng: $VLM_URL ($VLM_MODEL)"
-    elif curl -sf "$VLM_URL/models" >/dev/null 2>&1; then
-      c_ok "VLM server (vLLM/OpenAI-compatible) sẵn sàng: $VLM_URL"
-    else
-      c_err "Không kết nối được VLM ở $VLM_URL."
-      echo "   Mở Ollama:  ollama serve &  &&  ollama pull $VLM_MODEL"
-      echo "   hoặc vLLM:  vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8000  (VLM_URL=http://localhost:8000/v1)"
-      echo "   hoặc chạy model Hugging Face trực tiếp:  VLM=transformers"
-      echo "   hoặc chạy không cần VLM:  VLM=oracle (cận trên) / VLM=simulated (chỉ kiểm tra pipeline)"
-      exit 1
-    fi
-  fi
 }
 
 # ------------------------------------------------------------------------------ helpers
 fetch() { "$PYTHON" scripts/datasets/fetch.py "$@"; }
-
-bench() {   # bench <name> <config> <stride> <extra args...>
-  local name="$1" cfg="$2" stride="$3"; shift 3
-  local out="$RUN_DIR/$name"
-  local extra=()
-  [ -n "$MAX_VIDEOS" ] && extra+=(--max-videos "$MAX_VIDEOS")
-  [ -n "$MAX_FRAMES" ] && extra+=(--max-frames "$MAX_FRAMES")
-  if [ -f "$out/bank.npz" ]; then extra+=(--bank "$out/bank.npz"); fi
-  c_info "Benchmark $name (VLM=$VLM, budgets: $BUDGETS, stride $stride)"
-  # shellcheck disable=SC2086
-  "$PYTHON" scripts/vad_benchmark.py "$@" --config "$cfg" --vlm "$VLM" \
-      --vlm-url "$VLM_URL" --vlm-model "$VLM_MODEL" --budgets $BUDGETS --stride "$stride" \
-      --out "$out" ${extra[@]+"${extra[@]}"}
-  c_ok "$name xong -> $out/metrics.json"
-}
-
-fit_bank() {   # fit_bank <name> <config> <normal video dir> <stride> [fps]
-  local name="$1" cfg="$2" dir="$3" stride="$4" fps="${5:-}"
-  [ "$FIT_BANK" = 1 ] || return 0
-  [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ] || { c_warn "$name: không có video bình thường để fit bank, bỏ qua"; return 0; }
-  mkdir -p "$RUN_DIR/$name"
-  [ -f "$RUN_DIR/$name/bank.npz" ] && return 0
-  c_info "Fit kho chuyển động bình thường cho $name từ $dir"
-  local extra=(--max-videos "${BANK_MAX_VIDEOS:-60}")
-  [ -n "$fps" ] && extra+=(--fps "$fps")
-  [ -n "$MAX_FRAMES" ] && extra+=(--max-frames "$MAX_FRAMES")
-  "$PYTHON" scripts/fit_normal_bank.py --videos "$dir" --config "$cfg" --stride "$stride" \
-      --out "$RUN_DIR/$name/bank.npz" ${extra[@]+"${extra[@]}"}
-}
-
 have() { [ -e "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; }
 
-# ------------------------------------------------------------------------------ A2Seek (UAV, chính)
-run_a2seek() {
-  local root="$DATA_DIR/A2Seek" vids="$DATA_DIR/A2Seek-Videos"
-  local map="$root/edgestream_videos_test.json"
-  if [ "$DO_DOWNLOAD" = 1 ]; then
-    fetch a2seek --root "$root"
-    local extra=()
-    [ -n "$MAX_VIDEOS" ] && extra+=(--max-clips "$MAX_VIDEOS")
-    fetch a2seek-videos --root "$root" --videos "$vids" --split test ${extra[@]+"${extra[@]}"}
+# ------------------------------------------------------------------------------ referring MOT
+rmot_bench() {   # rmot_bench <name> <dataset> <root> <split> <seqmap> <config>
+  local name="$1" ds="$2" root="$3" split="$4" seqmap="$5" cfg="$6"
+  local extra=(--methods "$RMOT_METHODS" --lags "$LAGS" --vlm "$RMOT_VLM" --n-workers "$N_WORKERS" --jobs "$JOBS" --match-compute)
+  [ -f "$seqmap" ] && extra+=(--seqmap "$seqmap")
+  [ -n "$MAX_VIDEOS" ] && extra+=(--max-videos "$MAX_VIDEOS")
+  [ -n "$MAX_EXPR" ] && extra+=(--max-expr "$MAX_EXPR")
+  if [ "$RMOT_VLM" = openai ]; then
+    extra+=(--vlm-url "$RMOT_VLM_URL" --vlm-model "$RMOT_VLM_MODEL")
+    if ! curl -sf "$RMOT_VLM_URL/models" >/dev/null; then
+      c_err "Không gọi được $RMOT_VLM_URL. Mở server trước, ví dụ:"
+      echo "  vllm serve $RMOT_VLM_MODEL --enable-prefix-caching --max-model-len 8192 \\"
+      echo "       --gpu-memory-utilization 0.90 --limit-mm-per-prompt '{\"image\": 4}' --port 8000"
+      echo "  (hoặc RMOT_VLM=transformers để chạy model trực tiếp, chậm hơn vì tuần tự)"
+      return 1
+    fi
+  elif [ "$RMOT_VLM" = transformers ]; then
+    extra+=(--vlm-model "$RMOT_VLM_MODEL")
+  fi
+  c_info "RMOT $name: $ds/$split, methods=$RMOT_METHODS, L=$LAGS, VLM=$RMOT_VLM"
+  "$PYTHON" scripts/rmot_benchmark.py --dataset "$ds" --root "$root" --split "$split" --config "$cfg" \
+      --out "$RUN_DIR/$name" "${extra[@]}"
+}
+
+run_aerialmind() {
+  local dst="$DATA_DIR/AerialMind"
+  if [ "$DO_DOWNLOAD" = 1 ] && ! have "$dst/expression" && [ -z "$(find "$dst" -maxdepth 3 -type d -name expression 2>/dev/null | head -1)" ]; then
+    fetch aerialmind --out "$dst"
   fi
   [ "$DO_BENCH" = 1 ] || return 0
-  [ -f "$map" ] || skip "A2Seek: chưa có $map (chạy lại không có --bench-only)"
-  local scale
-  scale=$("$PYTHON" -c "import json;print(json.load(open('$map')).get('_frame_scale',1.0))")
-  bench a2seek configs/vad_uav.yaml "${STRIDE:-1}" --dataset a2seek \
-      --a2seek-samples "$root/dataset/cot_single/test.jsonl" --videos "$map" --a2seek-frame-scale "$scale"
-  # chấm bằng evaluate.py chính thức của A2Seek
-  local ref="third_party/A2Seek"
-  [ -d "$ref" ] || git clone -q --depth 1 https://github.com/2-mo/A2Seek "$ref"
-  for b in $BUDGETS; do
-    local bdir="$RUN_DIR/a2seek/budget_${b}"
-    local pred="$bdir/a2seek_predictions.jsonl"
-    [ -f "$pred" ] || continue
-    # evaluate.py đòi đủ dự đoán cho mọi mẫu: nếu vài clip không có video, chấm trên tập con có dự đoán
-    "$PYTHON" - "$root/dataset/cot_single/test.jsonl" "$pred" "$bdir/a2seek_references_covered.jsonl" <<'PY'
-import json, sys
-ref, pred, out = sys.argv[1:]
-key = lambda r: f"{r['g_id']}/{r['v_id']}/{int(r['f_id']):05d}"
-have = {key(json.loads(l)) for l in open(pred) if l.strip()}
-rows = [l for l in open(ref) if l.strip() and key(json.loads(l)) in have]
-open(out, "w").writelines(rows)
-total = sum(1 for l in open(ref) if l.strip())
-print(f"[a2seek] coverage {len(rows)}/{total} samples ({100 * len(rows) / max(total, 1):.1f}%)")
-PY
-    A2SEEK_DATA_ROOT="$root" "$PYTHON" "$ref/scripts/evaluate.py" --predictions "$pred" \
-        --references "$bdir/a2seek_references_covered.jsonl" \
-        --label-aliases "$ref/src/a2seek/configs/evaluation/label_aliases.json" \
-        --output "$RUN_DIR/a2seek/budget_${b}/a2seek_official_metrics.json" \
-      || c_warn "A2Seek evaluate.py lỗi ở budget $b (có thể do thiếu dự đoán cho clip không có video)"
+  [ -n "$(find "$dst" -maxdepth 3 -type d -name expression 2>/dev/null | head -1)" ] || skip "AerialMind chưa có ở $dst"
+  for sp in $AM_SPLITS; do
+    local sm="$dst/seqmap.txt"; [ "$sp" = cross_domain ] && sm="$dst/seqmap_cd.txt"
+    rmot_bench "aerialmind_$sp" aerialmind "$dst" "$sp" "$sm" configs/rmot_aerialmind.yaml
   done
 }
 
-# ------------------------------------------------------------------------------ UIT-ADrone (UAV, VN)
-run_uit_adrone() {
-  local src="$DATA_DIR/UIT-ADrone" conv="$DATA_DIR/UIT-ADrone/edgestream"
-  if [ "$DO_DOWNLOAD" = 1 ]; then
-    have "$src" || fetch uit-adrone --out "$src" || skip "UIT-ADrone: tải thủ công từ Google Drive vào $src rồi chạy lại"
-    fetch frame-labels --src "$src" --out "$conv"
+run_refer_kitti_v2() {
+  local dst="$DATA_DIR/refer-kitti-v2"
+  if [ "$DO_DOWNLOAD" = 1 ] && ! have "$dst/expression"; then
+    fetch refer-kitti-v2 --out "$dst"
   fi
   [ "$DO_BENCH" = 1 ] || return 0
-  fit_bank uit_adrone configs/vad_uav.yaml "$conv/train" "${STRIDE:-1}" 30
-  bench uit_adrone configs/vad_uav.yaml "${STRIDE:-1}" --dataset generic \
-      --videos "$conv/videos" --labels "$conv/labels" --fps 30
-}
-
-# ------------------------------------------------------------------------------ Drone-Anomaly (UAV)
-run_drone_anomaly() {
-  local src="$DATA_DIR/Drone-Anomaly" conv="$DATA_DIR/Drone-Anomaly/edgestream"
-  if [ "$DO_DOWNLOAD" = 1 ]; then
-    if ! have "$src"; then
-      c_warn "Drone-Anomaly chỉ có trên OneDrive, không tải tự động được."
-      echo "   1) Mở link OneDrive trong https://github.com/Jin-Pu/Drone-Anomaly"
-      echo "   2) Tải về và giải nén vào $src  (cấu trúc <scene>/<sequence>/{train,test})"
-      echo "   3) Chạy lại: bash scripts/run_benchmarks.sh drone_anomaly"
-      exit "$SKIP"
-    fi
-    fetch frame-labels --src "$src" --out "$conv"
-  fi
-  [ "$DO_BENCH" = 1 ] || return 0
-  fit_bank drone_anomaly configs/vad_uav.yaml "$conv/train" "${STRIDE:-1}" 30
-  bench drone_anomaly configs/vad_uav.yaml "${STRIDE:-1}" --dataset drone_anomaly \
-      --videos "$conv/videos" --labels "$conv/labels" --fps 30
-}
-
-# ------------------------------------------------------------------------------ MUVAD (UAV, camera di chuyển)
-run_muvad() {
-  local src="$DATA_DIR/MUVAD" conv="$DATA_DIR/MUVAD/edgestream"
-  have "$src" || skip "MUVAD chưa được công bố (https://github.com/uavano/FTDMamba). Khi có, giải nén vào $src rồi chạy lại."
-  [ "$DO_DOWNLOAD" = 1 ] && fetch frame-labels --src "$src" --out "$conv"
-  [ "$DO_BENCH" = 1 ] || return 0
-  fit_bank muvad configs/vad_uav.yaml "$conv/train" "${STRIDE:-1}" 30
-  bench muvad configs/vad_uav.yaml "${STRIDE:-1}" --dataset generic \
-      --videos "$conv/videos" --labels "$conv/labels" --fps "${MUVAD_FPS:-30}"
-}
-
-# ------------------------------------------------------------------------------ UCF-Crime (CCTV)
-run_ucf_crime() {
-  local dst="$DATA_DIR/UCF-Crime"
-  if [ "$DO_DOWNLOAD" = 1 ]; then
-    local extra=()
-    [ "$UCF_TRAIN_NORMAL" = 1 ] && extra+=(--with-train-normal)
-    [ "$KEEP_ZIPS" = 1 ] && extra+=(--keep-zips)
-    [ -f "$dst/Temporal_Anomaly_Annotation_for_Testing_Videos.txt" ] || fetch ucf-crime --out "$dst" ${extra[@]+"${extra[@]}"}
-  fi
-  [ "$DO_BENCH" = 1 ] || return 0
-  fit_bank ucf_crime configs/vad_cctv.yaml "$dst/train_normal" "${STRIDE:-2}"
-  bench ucf_crime configs/vad_cctv.yaml "${STRIDE:-2}" --dataset ucf_crime \
-      --videos "$dst/videos" --annotations "$dst/Temporal_Anomaly_Annotation_for_Testing_Videos.txt"
-}
-
-# ------------------------------------------------------------------------------ XD-Violence (CCTV + phim)
-run_xd_violence() {
-  local dst="$DATA_DIR/XD-Violence"
-  if [ "$DO_DOWNLOAD" = 1 ]; then
-    local extra=()
-    [ -n "$MAX_VIDEOS" ] && extra+=(--max-videos "$MAX_VIDEOS")
-    fetch xd-violence --out "$dst" ${extra[@]+"${extra[@]}"}
-  fi
-  [ "$DO_BENCH" = 1 ] || return 0
-  bench xd_violence configs/vad_cctv.yaml "${STRIDE:-2}" --dataset xd_violence \
-      --videos "$dst/data/video" --annotations "$dst/data/test_annotations.txt" \
-      --test-list "$dst/data/test_list.txt"
+  have "$dst/expression" || skip "Refer-KITTI-V2 chưa có ở $dst"
+  rmot_bench refer_kitti_v2 refer_kitti_v2 "$dst" test "$dst/seqmap.txt" configs/rmot_kitti.yaml
 }
 
 # ------------------------------------------------------------------------------ summary
 summarize() {
   "$PYTHON" - "$RUN_DIR" <<'EOF'
-import json, sys
+import sys
 from pathlib import Path
 run = Path(sys.argv[1])
-lines = ["# Kết quả benchmark", "",
-         "| Bộ dữ liệu | Budget (/phút) | Lượt VLM | Micro-AUC online | Micro-AUC offline | Macro-AUC offline | AP offline | A2Seek top-1 |",
-         "|---|---|---|---|---|---|---|---|"]
-for m in sorted(run.glob("*/metrics.json")):
-    for r in json.loads(m.read_text()):
-        f = lambda k: "" if r.get(k) is None else (f"{100 * r[k]:.1f}" if isinstance(r[k], float) else str(r[k]))
-        lines.append(f"| {m.parent.name} | {r['budget_calls_per_min']:g} | {r['vlm_calls']} | {f('online_micro_auc')} | "
-                     f"{f('offline_micro_auc')} | {f('offline_macro_auc')} | {f('offline_ap')} | "
-                     f"{f('a2seek_first_category_accuracy')} |")
+lines = ["# Kết quả benchmark referring MOT (HOTA@L)"]
+for sm in sorted(run.glob("*/summary.md")):
+    lines += ["", f"## {sm.parent.name}", "", sm.read_text()]
 (run / "summary.md").write_text("\n".join(lines) + "\n")
 print("\n".join(lines))
 EOF

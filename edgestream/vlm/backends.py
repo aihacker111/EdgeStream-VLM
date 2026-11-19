@@ -28,6 +28,53 @@ from ..types import Verdict
 
 
 @dataclass
+class ChatResult:
+    """Generic answer of :meth:`VLMBackend.chat`: text plus, per generated token, its top
+    alternatives as {token: logprob}. Used by the RMOT verifiers to read P(yes) per field."""
+    text: str
+    tokens: list                   # [(token_str, {alt_token_str: logprob})]
+    prompt_tokens: int
+    completion_tokens: int
+    latency_s: float
+
+
+def field_yes_probability(tokens: list, keys: list, yes: str = "yes", no: str = "no") -> dict:
+    """P(yes) / (P(yes) + P(no)) at the value of each JSON field ``"<key>": "yes|no"``.
+
+    Works whether the tokenizer emits the opening quote of the value separately or glued to the
+    value (``"yes``). Fields without readable alternatives are filled from the decoded text
+    (1.0 / 0.0) so the result always has every key the model answered.
+    """
+    want = {str(k) for k in keys}
+    out: dict = {}
+    acc = ""
+    pat_q = re.compile(r'"([^"]+)"\s*:\s*"$')
+    pat_n = re.compile(r'"([^"]+)"\s*:\s*$')
+    for tok, alts in tokens:
+        m = pat_q.search(acc) or pat_n.search(acc)
+        if m and m.group(1) in want and m.group(1) not in out:
+            py = pn = 0.0
+            for a, lp in (alts or {tok: 0.0}).items():
+                w = a.strip().strip('"').strip().lower()
+                if not w:
+                    continue
+                if yes.startswith(w) or w.startswith(yes):
+                    py += math.exp(lp)
+                elif no.startswith(w) or w.startswith(no):
+                    pn += math.exp(lp)
+            if py + pn > 0:
+                out[m.group(1)] = py / (py + pn)
+        acc += tok
+    obj = extract_json(acc) or {}
+    for k in want:
+        if k not in out and isinstance(obj.get(k), str):
+            v = obj[k].strip().lower()
+            if v in (yes, no):
+                out[k] = 1.0 if v == yes else 0.0
+    return out
+
+
+@dataclass
 class RawResult:
     text: str
     prompt_tokens: int
@@ -41,6 +88,11 @@ class VLMBackend:
 
     def generate(self, req: VLMRequest) -> RawResult:  # pragma: no cover - interface
         raise NotImplementedError
+
+    def chat(self, system: str, parts: list, max_new_tokens: int = 128, schema: dict | None = None,
+             top_logprobs: int = 5) -> ChatResult:  # pragma: no cover - interface
+        """Free-form request: ``parts`` = [("text", str) | ("image", BGR ndarray)]."""
+        raise NotImplementedError(f"{self.name} backend has no generic chat()")
 
     def __call__(self, req: VLMRequest) -> Verdict:
         raw = self.generate(req)
@@ -140,6 +192,45 @@ class OpenAICompatBackend(VLMBackend):
         with urllib.request.urlopen(r, timeout=self.timeout) as resp:
             return json.loads(resp.read().decode())
 
+    def chat(self, system: str, parts: list, max_new_tokens: int = 128, schema: dict | None = None,
+             top_logprobs: int = 5) -> ChatResult:
+        import urllib.error
+        content = [{"type": "text", "text": v} if k == "text" else
+                   {"type": "image_url", "image_url": {"url": _jpeg_data_url(v)}} for k, v in parts]
+        body = {"model": self.model, "temperature": self.temperature, "max_tokens": max_new_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}]}
+        t0 = time.perf_counter()
+        while True:
+            b = dict(body)
+            if schema is not None and self.use_schema:
+                b["response_format"] = {"type": "json_schema",
+                                        "json_schema": {"name": "answer", "schema": schema, "strict": True}}
+            if self.logprobs:
+                b["logprobs"], b["top_logprobs"] = True, top_logprobs
+            try:
+                data = self._post(b)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (400, 422) and self.logprobs:
+                    self.logprobs = False
+                elif e.code in (400, 422) and self.use_schema and schema is not None:
+                    self.use_schema = False
+                else:
+                    raise
+        dt = time.perf_counter() - t0
+        choice = data["choices"][0]
+        text = choice["message"].get("content") or ""
+        toks = []
+        for it in (choice.get("logprobs") or {}).get("content") or []:
+            alts = {a.get("token", ""): a.get("logprob", -1e9) for a in it.get("top_logprobs") or []}
+            alts.setdefault(it.get("token", ""), it.get("logprob", 0.0))
+            toks.append((it.get("token", ""), alts))
+        if not toks:
+            toks = [(text, {})]
+        usage = data.get("usage", {})
+        return ChatResult(text, toks, int(usage.get("prompt_tokens", 0)),
+                          int(usage.get("completion_tokens", 0)), dt)
+
     def generate(self, req: VLMRequest) -> RawResult:
         import urllib.error
         t0 = time.perf_counter()
@@ -223,6 +314,35 @@ class TransformersBackend(VLMBackend):
         text = self.processor.batch_decode([gen], skip_special_tokens=True)[0]
         conf = self._confidence(gen, out.scores)
         return RawResult(text, int(n_in), int(gen.shape[0]), dt, conf)
+
+    def chat(self, system: str, parts: list, max_new_tokens: int = 128, schema: dict | None = None,
+             top_logprobs: int = 5) -> ChatResult:
+        from PIL import Image
+        content = [{"type": "text", "text": v} if k == "text" else
+                   {"type": "image", "image": Image.fromarray(cv2.cvtColor(v, cv2.COLOR_BGR2RGB))}
+                   for k, v in parts]
+        messages = [{"role": "system", "content": [{"type": "text", "text": system}]},
+                    {"role": "user", "content": content}]
+        inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
+                                                    return_dict=True, return_tensors="pt").to(self.device)
+        t0 = time.perf_counter()
+        with self.torch.inference_mode():
+            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                                      output_scores=True, return_dict_in_generate=True)
+        if self.device.type == "mps":
+            self.torch.mps.synchronize()
+        dt = time.perf_counter() - t0
+        n_in = inputs["input_ids"].shape[1]
+        gen = out.sequences[0, n_in:].tolist()
+        tok = self.processor.tokenizer
+        toks = []
+        for i, tid in enumerate(gen):
+            lp = self.torch.log_softmax(out.scores[i][0].float(), dim=-1)
+            v, ix = lp.topk(top_logprobs)
+            alts = {tok.decode([int(j)]): float(x) for x, j in zip(v.tolist(), ix.tolist())}
+            toks.append((tok.decode([tid]), alts))
+        text = self.processor.batch_decode([out.sequences[0, n_in:]], skip_special_tokens=True)[0]
+        return ChatResult(text, toks, int(n_in), len(gen), dt)
 
     def _confidence(self, gen, scores) -> float | None:
         tok = self.processor.tokenizer

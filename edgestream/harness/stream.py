@@ -50,7 +50,7 @@ class VideoStream:
 
 
 class FrameFolderStream:
-    """A folder of frames (UIT-ADrone / Drone-Anomaly style releases) replayed at ``fps``."""
+    """A folder of frames replayed at ``fps``."""
 
     IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".tif")
 
