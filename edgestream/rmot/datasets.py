@@ -85,16 +85,32 @@ class RMOTVideo:
     fps: float = 30.0
     label_format: str = "auto"                          # auto | x1y1wh | cxcywh
     _wh: tuple | None = None
+    _auto_fmt: str | None = None
 
     def __len__(self) -> int:
         return len(self.frames)
 
     @property
     def fmt(self) -> str:
+        """Box convention of labels_with_ids. ``auto``: measured from the data (the reading that keeps
+        boxes inside the image); the path rule of the RMOT/AerialMind code only breaks ties.
+        Measured on AerialMind: VisDrone and UAVDT are both top-left x,y,w,h (reading UAVDT as
+        centre puts 7-9% of its boxes outside the image)."""
         if self.label_format != "auto":
             return self.label_format
-        p = (self.label_dir + self.video_id).lower()
-        return "x1y1wh" if ("uav" in p or "kitti" in p) else "cxcywh"
+        if self._auto_fmt is None:
+            p = (self.label_dir + self.video_id).lower()
+            rule = "x1y1wh" if ("uav" in p or "kitti" in p) else "cxcywh"
+            chk = check_label_format(self, n_frames=40) if self.label_dir else {"n": 0}
+            if chk["n"] and abs(chk["x1y1wh"] - chk["cxcywh"]) > 0.005:
+                self._auto_fmt = chk["best"]
+                if self._auto_fmt != rule:
+                    warnings.warn(f"{self.video_id}: labels measured as {self._auto_fmt} "
+                                  f"(out-of-image x1y1wh={chk['x1y1wh']:.3f}, cxcywh={chk['cxcywh']:.3f}); "
+                                  f"the path rule would say {rule}. Using {self._auto_fmt}.")
+            else:
+                self._auto_fmt = rule
+        return self._auto_fmt
 
     @property
     def image_wh(self) -> tuple[int, int]:
