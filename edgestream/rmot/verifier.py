@@ -62,20 +62,34 @@ class FrameSource:
     """Random access to frames by rank: image files on disk or an in-memory ring buffer."""
 
     def __init__(self, paths: list | None = None, cache: int = 64):
+        import threading
         self.paths = paths or []
         self.buf: OrderedDict = OrderedDict()
         self.cache = cache
+        self._lock = threading.Lock()            # concurrent VLM requests share the cache
+
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        d.pop("_lock", None)
+        return d
+
+    def __setstate__(self, d):
+        import threading
+        self.__dict__.update(d)
+        self._lock = threading.Lock()
 
     def put(self, rank: int, frame: np.ndarray) -> None:
-        self.buf[rank] = frame
-        self.buf.move_to_end(rank)
-        while len(self.buf) > self.cache:
-            self.buf.popitem(last=False)
+        with self._lock:
+            self.buf[rank] = frame
+            self.buf.move_to_end(rank)
+            while len(self.buf) > self.cache:
+                self.buf.popitem(last=False)
 
     def get(self, rank: int) -> np.ndarray | None:
-        if rank in self.buf:
-            self.buf.move_to_end(rank)
-            return self.buf[rank]
+        with self._lock:
+            if rank in self.buf:
+                self.buf.move_to_end(rank)
+                return self.buf[rank]
         if 0 <= rank < len(self.paths):
             img = cv2.imread(self.paths[rank])
             if img is not None:
@@ -228,6 +242,8 @@ class VLMVerifier:
 
     def __init__(self, backend, overview_width: int = 1280, facts: bool = True, max_new_tokens: int = 160):
         self.backend = backend
+        # concurrent calls only make sense for a server (vLLM batches them); a local model is sequential
+        self.parallel = getattr(backend, "name", "") in ("openai", "vllm", "ollama") or hasattr(backend, "_post")
         self.overview_width = overview_width
         self.facts = facts
         self.max_new_tokens = max_new_tokens
@@ -288,6 +304,8 @@ class OracleVerifier:
     models comparative judgement (0 by default, i.e. no advantage is assumed).
     """
 
+    parallel = False                # deterministic random stream: always sequential
+
     def __init__(self, truth_refer, truth_same, acc: float = 0.9, conf: float = 0.85, set_bonus: float = 0.0,
                  seed: int = 0, latency_base: float = 0.35, latency_per_cand: float = 0.04):
         self.truth_refer, self.truth_same = truth_refer, truth_same
@@ -322,7 +340,9 @@ class CachedVerifier:
     def __init__(self, inner, path: str | None = None):
         import json
         import os
+        import threading
         self.inner, self.path = inner, path
+        self._lock = threading.Lock()
         self.mem: dict = {}
         self.hits = self.misses = 0
         if path and os.path.isfile(path):
@@ -334,6 +354,10 @@ class CachedVerifier:
                         continue
                     self.mem[r["k"]] = r
         self._f = open(path, "a") if path else None
+
+    @property
+    def parallel(self):
+        return getattr(self.inner, "parallel", False)
 
     @property
     def facts(self):
@@ -352,20 +376,23 @@ class CachedVerifier:
         import json
         r = {"k": k, "p": probs, "lat": ans.latency_s, "pt": ans.prompt_tokens, "ct": ans.completion_tokens,
              "vt": ans.visual_tokens, "n": ans.n_cands}
-        self.mem[k] = r
-        if self._f:
-            self._f.write(json.dumps(r) + "\n")
-            self._f.flush()
+        with self._lock:
+            self.mem[k] = r
+            if self._f:
+                self._f.write(json.dumps(r) + "\n")
+                self._f.flush()
 
     def refer(self, g, group, anchor_rank, expr, frames, single: bool = False) -> Answer:
         keys = [self._seg_key(s) for s in group]
         k = f"R|{expr}|{anchor_rank}|{int(single)}|{int(bool(self.facts))}|{','.join(keys)}"
         r = self.mem.get(k)
         if r is not None:
-            self.hits += 1
+            with self._lock:
+                self.hits += 1
             probs = {s.sid: r["p"][kk] for s, kk in zip(group, keys) if kk in r["p"]}
             return Answer("refer", probs, r["lat"], r["pt"], r["ct"], r["vt"], r["n"], meta={"cached": True})
-        self.misses += 1
+        with self._lock:
+            self.misses += 1
         ans = self.inner.refer(g, group, anchor_rank, expr, frames, single=single)
         self._store(k, ans, {kk: ans.probs[s.sid] for s, kk in zip(group, keys) if s.sid in ans.probs})
         return ans
@@ -374,10 +401,12 @@ class CachedVerifier:
         k = f"L|{self._seg_key(a)}|{self._seg_key(b)}"
         r = self.mem.get(k)
         if r is not None:
-            self.hits += 1
+            with self._lock:
+                self.hits += 1
             return Answer("link", {(a.sid, b.sid): r["p"]["same"]} if "same" in r["p"] else {}, r["lat"],
                           r["pt"], r["ct"], r["vt"], r["n"], meta={"cached": True})
-        self.misses += 1
+        with self._lock:
+            self.misses += 1
         ans = self.inner.link(g, a, b, frames)
         p = ans.probs.get((a.sid, b.sid))
         self._store(k, ans, {} if p is None else {"same": p})

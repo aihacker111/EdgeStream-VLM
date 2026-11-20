@@ -103,6 +103,22 @@ def render(video, seq: str, panels: list, out_path: str, frames_dir: bool, fps: 
         writer.release()
 
 
+def score_finished(d: str, split) -> dict:
+    """HOTA per sequence for the streams already written (benchmark still running / interrupted)."""
+    seqs = []
+    for vid in split.videos:
+        vd = os.path.join(d, vid)
+        if not os.path.isdir(vd):
+            continue
+        for expr in sorted(os.listdir(vd)):
+            if os.path.isfile(os.path.join(vd, expr, "predict.txt")) and os.path.isfile(os.path.join(vd, expr, "gt.txt")):
+                seqs.append(f"{vid}+{expr}")
+    if not seqs:
+        return {}
+    print(f"{d}: per_seq.json not written yet (run not finished); scoring the {len(seqs)} finished sequences")
+    return H.evaluate_folder(d, seqs, {v: len(x) for v, x in split.videos.items()})["per_seq"]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", required=True, help="the --out folder of rmot_benchmark.py")
@@ -124,19 +140,19 @@ def main():
     for d in dirs:
         if not os.path.isdir(d):
             sys.exit(f"{d} not found (run rmot_benchmark.py first; check --methods/--lag)")
+    split = load_split(a.dataset, a.root, a.split, None)
     per = []
     for d in dirs:
         p = os.path.join(d, "per_seq.json")
-        per.append(json.load(open(p)) if os.path.isfile(p) else {})
+        per.append(json.load(open(p)) if os.path.isfile(p) else score_finished(d, split))
     seqs = list(a.seq)
     if a.worst or a.best:
         if not per[0]:
-            sys.exit(f"{dirs[0]}/per_seq.json missing: the run has not been evaluated yet; use --seq")
+            sys.exit(f"no finished sequence in {dirs[0]} yet (no predict.txt): wait for the benchmark")
         ranked = sorted(per[0].items(), key=lambda kv: kv[1]["HOTA"])
         seqs += [k for k, _ in ranked[: a.worst]] + [k for k, _ in ranked[::-1][: a.best]]
     if not seqs:
         sys.exit("nothing to draw: give --seq, --worst or --best")
-    split = load_split(a.dataset, a.root, a.split, None)
     cfg_fps = 10.0 if "kitti" in a.dataset else 30.0
     for seq in dict.fromkeys(seqs):
         vid, expr = seq.split("+", 1)

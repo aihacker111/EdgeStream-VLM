@@ -191,9 +191,11 @@ def _run_unit(unit) -> list:
             else:
                 ver = _W["cached"]
             t0 = time.time()
+            if _W.get("on_start"):
+                _W["on_start"](f"{vid} | {m}@L{lag_name(L)}")      # what is running NOW
             res = OnlineRMOT(rc, ver, zoom_detect=_W["zoom"]).run(perc, expr.text, fps, (W, Hh), frames, aff)
             if _W.get("on_run"):
-                _W["on_run"](f"{vid} | {m}@L{lag_name(L)}")
+                _W["on_run"]()
             if m == "search" and L == INF:
                 calls_search_inf = res["stats"]["vlm"]["calls"]
             d = os.path.join(a["out"], f"{m}_L{lag_name(L)}")
@@ -374,9 +376,13 @@ def main():
 
     if a.jobs <= 1:
         _init_worker(state, split)
-        inner = bar(len(methods) * len(lags), "  runs", "run", leave=False, position=1)
-        _W["on_run"] = lambda label: (inner.set_description(f"  {label}"), inner.update(1))
-        _W["on_unit"] = lambda: inner.reset(total=len(methods) * len(lags))
+        if sys.stderr.isatty():                  # a second line only in a real terminal (no blank lines in logs)
+            inner = bar(len(methods) * len(lags), "  runs", "run", leave=False, position=1)
+            _W["on_start"] = lambda label: inner.set_description(f"  {label}")
+            _W["on_run"] = lambda: inner.update(1)
+            _W["on_unit"] = lambda: inner.reset(total=len(methods) * len(lags))
+        else:
+            inner = _NoBar()
         for u in todo:
             after(_run_unit(u))
         inner.close()

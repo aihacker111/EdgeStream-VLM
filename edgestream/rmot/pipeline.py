@@ -284,7 +284,11 @@ class OnlineRMOT:
         return reqs
 
     def _dispatch(self, g: TrackletGraph, now: float, expr: str) -> None:
-        while self.pool and self.vlm.budget_left() and self.vlm.free_worker(now) is not None:
+        """Start one request per free worker; the calls of one tick run concurrently."""
+        free = sum(1 for f in self.vlm.free_at if f <= now + 1e-9)
+        batch = []
+        while self.pool and free > 0 and (self.vlm.cfg.max_calls is None or
+                                          self.vlm.calls + len(batch) < self.vlm.cfg.max_calls):
             req = self.pool.pop(0)
             if req.key in self.issued:
                 continue
@@ -293,11 +297,14 @@ class OnlineRMOT:
                 grp = [g.segs[sid] for sid in req.members]
                 for s in grp:
                     s.n_asked_pending += 1
-                self.vlm.submit(now, req, lambda: self.verifier.refer(g, grp, req.anchor_rank, expr, self._frames))
+                fn = (lambda grp=grp, ar=req.anchor_rank: self.verifier.refer(g, grp, ar, expr, self._frames))
             else:
                 i, j = req.members[0]
                 g.edges[(i, j)].n_asked += 1
-                self.vlm.submit(now, req, lambda: self.verifier.link(g, g.segs[i], g.segs[j], self._frames))
+                fn = (lambda i=i, j=j: self.verifier.link(g, g.segs[i], g.segs[j], self._frames))
+            batch.append((req, fn))
+            free -= 1
+        self.vlm.submit_many(now, batch, parallel=getattr(self.verifier, "parallel", False))
 
     def _apply(self, g: TrackletGraph, now: float) -> None:
         for t_avail, ans, req in self.vlm.collect(now):
@@ -502,6 +509,7 @@ class OnlineRMOT:
             self.solver.cfg.time_limit_s = max(self.solver.cfg.time_limit_s, 5.0)
             self._solve(g, tt)
             self._commit(g, INF)
+        self.vlm.close()
         rows = _finalize(self.rows, N, c.stride)
         return {"rows": rows, "stats": {
             "vlm": self.vlm.stats(), "segments": len(g.segs), "edges": len(g.edges),
@@ -540,12 +548,17 @@ class OnlineRMOT:
                     answers.setdefault(g.segs[sid].gid, []).append((req.anchor_rank, t_avail, p))
 
         def dispatch(now):
-            while queue and self.vlm.budget_left() and self.vlm.free_worker(now) is not None:
+            free = sum(1 for f in self.vlm.free_at if f <= now + 1e-9)
+            single = c.filter_prompt == "single"
+            batch = []
+            while queue and free > 0 and (self.vlm.cfg.max_calls is None or
+                                          self.vlm.calls + len(batch) < self.vlm.cfg.max_calls):
                 kf, dl, grp = queue.pop(0)
-                req = Request("single" if c.filter_prompt == "single" else "refer", ("kf", kf, grp[0].sid),
-                              [s.sid for s in grp], kf, 1.0)
-                single = c.filter_prompt == "single"
-                self.vlm.submit(now, req, lambda: self.verifier.refer(g, grp, kf, expr, self._frames, single=single))
+                req = Request("single" if single else "refer", ("kf", kf, grp[0].sid), [s.sid for s in grp], kf, 1.0)
+                batch.append((req, lambda grp=grp, kf=kf: self.verifier.refer(g, grp, kf, expr, self._frames,
+                                                                               single=single)))
+                free -= 1
+            self.vlm.submit_many(now, batch, parallel=getattr(self.verifier, "parallel", False))
 
         def enqueue(kf, dl, grp):
             # a newer keyframe supersedes a still-pending older one of the same track(s): an
@@ -600,6 +613,7 @@ class OnlineRMOT:
                     break
             apply(INF)
         finally:
+            self.vlm.close()
             if old_facts is not None:
                 self.verifier.facts = old_facts
         rows = []

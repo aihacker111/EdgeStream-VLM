@@ -75,10 +75,27 @@ class AsyncVLM:
         return self.lat_ema.get(kind, 0.6)
 
     def submit(self, now: float, req: Request, fn) -> float:
+        return self.submit_many(now, [(req, fn)], parallel=False)[0]
+
+    def submit_many(self, now: float, items: list, parallel: bool = True) -> list:
+        """Start several requests at logical time ``now``. With ``parallel`` the backend calls really
+        run concurrently (threads), so a vLLM server batches them; the logical schedule is the
+        same as submitting them one by one."""
+        if not items:
+            return []
+        if parallel and len(items) > 1:
+            if getattr(self, "_pool", None) is None:
+                from concurrent.futures import ThreadPoolExecutor
+                self._pool = ThreadPoolExecutor(max_workers=max(self.cfg.n_workers, 1))
+            answers = list(self._pool.map(lambda it: it[1](), items))
+        else:
+            answers = [fn() for _, fn in items]
+        return [self._account(now, req, ans) for (req, _), ans in zip(items, answers)]
+
+    def _account(self, now: float, req: Request, ans) -> float:
         w = self.free_worker(now)
         start = now if w is not None else min(self.free_at)
         w = w if w is not None else self.free_at.index(start)
-        ans = fn()
         lat = self.cfg.fixed_latency_s if self.cfg.fixed_latency_s is not None else ans.latency_s * self.cfg.latency_scale
         lat = max(lat, 1e-3)
         self.lat_ema[req.kind] = 0.8 * self.lat_ema.get(req.kind, lat) + 0.2 * lat
@@ -98,6 +115,11 @@ class AsyncVLM:
             p = heapq.heappop(self.pending)
             out.append((p.t_avail, p.answer, p.request))
         return out
+
+    def close(self) -> None:
+        if getattr(self, "_pool", None) is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
 
     def drain_time(self) -> float:
         return max([p.t_avail for p in self.pending] + [max(self.free_at)])
