@@ -135,6 +135,26 @@ tracks + ReID embeddings + ego affine). VLM answers are cached by exact prompt c
 latency is replayed, so the logical clock is unchanged. `--tracks-dir` runs everything on an
 external tracker's MOT files instead (perception-matched comparison with other papers).
 
+### Verifier fine-tuning (LoRA, AerialMind train split only)
+
+Zero-shot verifiers top out around AUC 0.75 on AerialMind (`rmot_diagnose.py --mode probe`).
+The verifier can be adapted on the **train** videos (never the test lists) with the exact
+inference prompt (v2, built by `VLMVerifier.build_v2`) and a one-word yes/no target:
+
+```bash
+python scripts/rmot_make_sft.py --root data/AerialMind --out data/rmot_sft --max-expr 100 --pos 4 --neg 4
+python scripts/rmot_train_lora.py --data data/rmot_sft --model Qwen/Qwen3-VL-2B-Instruct --out runs/lora_vl2b \
+       --epochs 1 --batch 2 --grad-accum 8 --lr 1e-4               # stop vLLM first; --qlora for 4B on 24 GB
+python scripts/rmot_train_lora.py --data data/rmot_sft --model Qwen/Qwen3-VL-2B-Instruct --out runs/lora_vl2b \
+       --adapter runs/lora_vl2b/best --merge-to runs/lora_vl2b/merged
+vllm serve runs/lora_vl2b/merged --served-model-name rmot --enable-prefix-caching ...   # same flags as above
+python scripts/rmot_diagnose.py --mode probe ... --vlm-model rmot   # compare with the zero-shot probe
+```
+
+Candidates are the tracker's own pieces (test-time distribution), labelled from GT (referred
+fraction ≥ 0.6 → yes, ≤ 0.1 → no); half the negatives are hard (right class, referred by another
+expression). Validation is on held-out train videos; the best adapter by AUC is kept.
+
 ## Install
 
 ```bash

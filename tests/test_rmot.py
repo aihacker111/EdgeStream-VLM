@@ -338,3 +338,21 @@ def test_graph_survives_real_tracker_patterns():
     assert any(s.cut_reason == "resume" for s in g.segs.values())
     for (i, j), e in g.edges.items():
         assert i != j and g.segs[i].t1 <= g.segs[j].t0
+
+
+def test_v2_frame_cache_never_mixes_videos(tmp_path):
+    """Regression: the v2 frame cache was keyed by rank only and served the previous video's frame."""
+    import cv2
+    paths = {}
+    for vid, val in (("a", 10), ("b", 240)):
+        d = tmp_path / vid
+        d.mkdir()
+        paths[vid] = []
+        for r in range(3):
+            p = str(d / f"{r:06d}.jpg")
+            cv2.imwrite(p, np.full((72, 128, 3), val, np.uint8))
+            paths[vid].append(p)
+    ver = VLMVerifier(_FakeChat(), prompt="v2", frame_width=64)
+    fa = ver._frame_image(FrameSource(paths["a"]), 1)
+    fb = ver._frame_image(FrameSource(paths["b"]), 1)
+    assert fa.mean() < 50 and fb.mean() > 200

@@ -67,3 +67,39 @@ def test_transformers_backend_runs_an_rmot_set_request(tmp_path):
     assert all(0.0 <= p <= 1.0 for p in ans.probs.values())        # random weights: any answers, valid range
     one = v.refer(g, grp[:1], 10, "red cars", frames)               # prompt v2: one token, no schema
     assert one.completion_tokens == 1 and all(0.0 <= p <= 1.0 for p in one.probs.values())
+
+
+def test_sft_data_and_lora_training_end_to_end(tmp_path):
+    """rmot_make_sft.py -> rmot_train_lora.py (2 epochs on a tiny Qwen3-VL) -> adapter, eval, merge."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    pytest.importorskip("peft")
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(Path(__file__).parent))
+    from synthetic_rmot import write_fake_aerialmind
+    try:
+        _tiny_qwen3_vl(tmp_path / "m")
+    except Exception as e:
+        pytest.skip(f"cannot build a tiny Qwen3-VL with transformers {transformers.__version__}: {e}")
+    am = tmp_path / "am"
+    write_fake_aerialmind(str(am), ("uav0000013_00000_v", "uav0000020_00406_v", "uav0000009_03358_v"), n=30)
+    sft = tmp_path / "sft"
+    run = lambda *args: subprocess.run([sys.executable, *map(str, args)], cwd=root, capture_output=True, text=True, timeout=600)
+    r = run("scripts/rmot_make_sft.py", "--root", am, "--out", sft, "--tracks-dir", am / "tracks", "--val-videos", "1")
+    assert r.returncode == 0, r.stderr[-2000:]
+    rows = [json.loads(x) for x in open(sft / "train.jsonl")]
+    assert rows and {x["label"] for x in rows} == {0, 1}
+    m = rows[0]["messages"]
+    assert m[-1]["content"][0]["text"] in ("yes", "no") and m[-1]["role"] == "assistant"
+    assert all((sft / c["image"]).is_file() for c in m[1]["content"] if c["type"] == "image")
+    out = tmp_path / "lora"
+    r = run("scripts/rmot_train_lora.py", "--data", sft, "--model", tmp_path / "m", "--out", out, "--epochs", "1",
+            "--batch", "2", "--grad-accum", "1", "--eval-every", "2", "--device", "cpu")
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert (out / "best" / "adapter_model.safetensors").is_file() or (out / "last" / "adapter_model.safetensors").is_file()
+    ad = out / ("best" if (out / "best").is_dir() else "last")
+    r = run("scripts/rmot_train_lora.py", "--data", sft, "--model", tmp_path / "m", "--out", out, "--adapter", ad,
+            "--merge-to", out / "merged", "--device", "cpu")
+    assert r.returncode == 0 and (out / "merged" / "config.json").is_file(), r.stderr[-2000:]

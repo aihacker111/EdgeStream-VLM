@@ -27,6 +27,9 @@ Việc tiếp theo (theo thứ tự):
 - [ ] Bảng chính: HOTA@L (L=0,2,5,∞) cho search vs filter_kf vs filter_ef (cùng thông lượng VLM); so với HETrack 31.46 (offline)
 - [ ] Ablation: search_single (set-level có ích?), search_nolink (stitching), không facts, R/K scaling curve
 - [ ] Refer-KITTI-V2 với tracks bên ngoài (`--tracks-dir`) vì AERO-MOT train trên VisDrone
+- [x] Pipeline LoRA SFT cho verifier (prompt v2, yes/no): `rmot_make_sft.py` + `rmot_train_lora.py` (merge → vLLM)
+- [ ] Chạy SFT 2B trên AerialMind train; so AUC probe trước/sau; rồi 4B (QLoRA)
+- [ ] Bảng ablation: zero-shot vs LoRA trong HOTA (search, filter_kf dùng cùng verifier)
 - [ ] (tuỳ) GRPO + LoRA cho Qwen3-VL-4B trên câu hỏi set-level từ tập train
 
 ---

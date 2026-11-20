@@ -271,7 +271,10 @@ class VLMVerifier:
     def _frame_image(self, frames: FrameSource, rank: int):
         """Resized, UNMARKED frame: byte-identical for every request at this anchor, so the server's
         prefix cache reuses its vision encoding and KV across candidates and expressions."""
-        key = (rank, self.frame_width)
+        # key by the image FILE (or the FrameSource object): ranks repeat across videos, and a key on
+        # the rank alone served frames of the previous video
+        src = frames.paths[rank] if 0 <= rank < len(frames.paths) else (id(frames), rank)
+        key = (src, self.frame_width)
         with self._fc_lock:
             if key in self._frame_cache:
                 self._frame_cache.move_to_end(key)
@@ -306,7 +309,9 @@ class VLMVerifier:
             tiles.append(np.full((self.crop_h, 6, 3), 255, np.uint8))
         return np.concatenate(tiles[:-1], 1) if tiles else None, o, early
 
-    def _refer_v2(self, g: TrackletGraph, s: Segment, anchor_rank: int, expr: str, frames: FrameSource) -> Answer:
+    def build_v2(self, g: TrackletGraph, s: Segment, anchor_rank: int, expr: str, frames: FrameSource) -> tuple:
+        """System prompt and parts of the v2 request. ONE builder for inference and for the
+        fine-tuning data (scripts/rmot_make_sft.py), so training and serving prompts are identical."""
         fr = self._frame_image(frames, anchor_rank)
         strip, o, early = self._strip(g, s, anchor_rank, frames)
         W, H = g.image_wh
@@ -331,9 +336,13 @@ class VLMVerifier:
             txt += "\nMeasured: " + candidate_fact("c", s, g).split("] ", 1)[-1] + " " + drone_fact(g)
         txt += f'\nDoes this {s.cls_name} match "{expr}"? Answer yes or no.'
         parts.append(("text", txt))
-        res = self.backend.chat(SYSTEM_V2, parts, max_new_tokens=1, schema=None, top_logprobs=self.top_logprobs)
+        return SYSTEM_V2, parts
+
+    def _refer_v2(self, g: TrackletGraph, s: Segment, anchor_rank: int, expr: str, frames: FrameSource) -> Answer:
+        system, parts = self.build_v2(g, s, anchor_rank, expr, frames)
+        res = self.backend.chat(system, parts, max_new_tokens=1, schema=None, top_logprobs=self.top_logprobs)
         p = first_token_yes_probability(res.tokens, res.text)
-        imgs = [im for im in (fr, strip) if im is not None]
+        imgs = [v for k, v in parts if k == "image"]
         return Answer("refer", {} if p is None else {s.sid: p}, res.latency_s, res.prompt_tokens,
                       res.completion_tokens, self._cost(imgs), 1, res.text)
 
@@ -475,7 +484,7 @@ class CachedVerifier:
     def refer(self, g, group, anchor_rank, expr, frames, single: bool = False) -> Answer:
         keys = [self._seg_key(s) for s in group]
         pv = getattr(self.inner, "prompt", "v1") if len(group) == 1 else "set"
-        k = f"R3|{pv}|{self.scope}|{expr}|{anchor_rank}|{int(single)}|{int(bool(self.facts))}|{','.join(keys)}"
+        k = f"R4|{pv}|{self.scope}|{expr}|{anchor_rank}|{int(single)}|{int(bool(self.facts))}|{','.join(keys)}"
         r = self.mem.get(k)
         if r is not None:
             with self._lock:
