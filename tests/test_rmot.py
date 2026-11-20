@@ -286,3 +286,29 @@ def test_benchmark_script_smoke(tmp_path):
     assert res.returncode == 0, res.stderr[-2000:]
     assert (out / "summary.md").is_file() and (out / "search_Linf" / "uav0000009_03358_v" / "Cars" / "predict.txt").is_file()
     assert "search" in (out / "summary.md").read_text()
+
+
+def test_graph_survives_real_tracker_patterns():
+    """Same id re-found after the track was closed, duplicate ids in a frame, class flips,
+    recovered runs, empty frames - patterns of real AERO-MOT output on VisDrone."""
+    from perception.types import TrackOutput
+    rng = np.random.default_rng(0)
+    g = TrackletGraph(GraphConfig(fps=30.0))
+    for r in range(300):
+        tracks = []
+        for gid in range(1, 12):
+            if (r // 20 + gid) % 4 == 0:                  # id disappears > end_after_s, then resumes
+                continue
+            cls = "car" if (r // 50 + gid) % 7 else "van"
+            box = np.array([50 * gid + r, 40 + gid, 30, 20], np.float32) + rng.normal(0, 1, 4).astype(np.float32)
+            tracks.append(TrackOutput(gid, gid, 3, cls, box, np.zeros(2, np.float32), 0.8, 0.8, r,
+                                      bool(r % 9 == 0)))
+        if r % 37 == 0 and tracks:
+            tracks.append(tracks[0])                       # duplicate id in one frame
+        if r % 61 == 0:
+            tracks = []                                    # empty frame
+        g.update(r, r / 30.0, tracks, (1920, 1080), None)
+    assert all(s.obs for s in g.segs.values())
+    assert any(s.cut_reason == "resume" for s in g.segs.values())
+    for (i, j), e in g.edges.items():
+        assert i != j and g.segs[i].t1 <= g.segs[j].t0

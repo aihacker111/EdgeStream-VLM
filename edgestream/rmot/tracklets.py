@@ -229,8 +229,9 @@ class TrackletGraph:
             if s is None:
                 prev = self.track_of.get(gid)
                 if prev:                       # the tracker re-found its own id after we closed it
+                    last = prev[-1]            # read BEFORE _new_seg appends the new piece to this list
                     s = self._new_seg(gid, tr.cls_name, "resume", first=False)
-                    self.add_edge(prev[-1], s.sid, "cont", cfg.p_cont_weak, gap_s=t - self.segs[prev[-1]].t1)
+                    self.add_edge(last, s.sid, "cont", cfg.p_cont_weak, gap_s=t - self.segs[last].t1)
                 else:
                     s = self._new_seg(gid, tr.cls_name, "start", first=True)
                     starts.append((s, o))
