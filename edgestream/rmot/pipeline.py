@@ -61,11 +61,20 @@ class RMOTConfig:
     keyframe_every: int = 10        # frames between keyframes (1 = every-frame filter)
     filter_prompt: str = "single"   # single (YesTrack-style) | set
     filter_facts: bool = False      # YesTrack does not see measured kinematics
+    facts: bool | None = None       # search: override the verifier's measured-facts text (None = keep)
+    # Platt calibration of the VLM's P(yes) per prompt kind, fitted on the TRAIN split with
+    # scripts/rmot_diagnose.py: calibrated logit = a * logit(p) + b
+    calib: dict = field(default_factory=dict)       # {"set": [a, b], "single": [a, b]}
     filter_propagate: str = "forward"   # forward (online) | nearest (offline TRP)
     graph: GraphConfig = field(default_factory=GraphConfig)
     solver: SolverConfig = field(default_factory=SolverConfig)
     sched: SchedulerConfig = field(default_factory=SchedulerConfig)
     zoom_cfg: ZoomConfig = field(default_factory=ZoomConfig)
+
+    def cal_logit(self, p: float, kind: str) -> float:
+        z = logit(p, 0.02)
+        ab = (self.calib or {}).get(kind)
+        return z if not ab else float(ab[0]) * z + float(ab[1])
 
     @classmethod
     def from_dict(cls, d: dict) -> "RMOTConfig":
@@ -314,8 +323,9 @@ class OnlineRMOT:
                 for sid in req.members:
                     s = g.segs[sid]
                     s.n_asked_pending = max(0, s.n_asked_pending - 1)
+                kind = "single" if len(req.members) == 1 else "set"
                 for sid, p in ans.probs.items():
-                    g.segs[sid].vlm_logits.append(logit(p, 0.02))
+                    g.segs[sid].vlm_logits.append(self.cfg.cal_logit(p, kind))
             else:
                 for key, p in ans.probs.items():
                     if key in g.edges:
@@ -425,6 +435,17 @@ class OnlineRMOT:
         c = self.cfg
         if c.method == "filter":
             return self._run_filter(perception, expr, fps, image_wh, frames, affines)
+        old_facts = getattr(self.verifier, "facts", None)
+        if c.facts is not None and old_facts is not None:
+            self.verifier.facts = c.facts
+        try:
+            return self._run_search(perception, expr, fps, image_wh, frames, affines)
+        finally:
+            if c.facts is not None and old_facts is not None:
+                self.verifier.facts = old_facts
+
+    def _run_search(self, perception, expr, fps, image_wh, frames, affines) -> dict:
+        c = self.cfg
         self.fps = fps
         self._frames = frames or FrameSource()
         q = parse(expr)
@@ -632,7 +653,7 @@ class OnlineRMOT:
                 if p is None:
                     ok = prior_of.get(s.gid, c.prior_base) > c.solver.tau
                 else:
-                    ok = logit(p, 0.02) > c.solver.tau
+                    ok = c.cal_logit(p, "single" if c.filter_prompt == "single" else "set") > c.solver.tau
                 if ok:
                     rows.append((o.rank + 1, s.gid, *[float(v) for v in o.box]))
         return {"rows": _finalize(rows, N, c.stride),

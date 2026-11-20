@@ -59,7 +59,12 @@ class Recorder:
 
     def refer(self, g, group, anchor_rank, expr, frames, single=False):
         ans = self.inner.refer(g, group, anchor_rank, expr, frames, single=single)
-        kind = "single" if (single or len(group) == 1) else "set"
+        n = len(group)
+        size = "1" if n == 1 else ("2-4" if n <= 4 else "5-8")
+        pv = getattr(getattr(self.inner, "inner", self.inner), "prompt", "v1")
+        one = single or n == 1
+        kind = ((f"one candidate ({pv})" if one else f"set prompt g={size}")
+                + (" +facts" if self.facts else " -facts"))
         for s in group:
             p = ans.probs.get(s.sid)
             self.sink.append({"video": self.video, "expr": self.expr, "method": self.method, "kind": kind,
@@ -83,6 +88,21 @@ def auc(y, s):
         ranks[m] = ranks[m].mean()
     npos = y.sum()
     return float((ranks[y].sum() - npos * (npos + 1) / 2) / (npos * (len(y) - npos)))
+
+
+def platt(z, y, l2: float = 1e-3, iters: int = 50):
+    """Fit P(truth) = sigmoid(a * z + b) by Newton's method (z = logit of the VLM's P(yes))."""
+    X = np.stack([z, np.ones_like(z)], 1)
+    w = np.array([1.0, 0.0])
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-np.clip(X @ w, -30, 30)))
+        g = X.T @ (p - y) + l2 * w
+        Hm = (X * (p * (1 - p))[:, None]).T @ X + l2 * np.eye(2)
+        step = np.linalg.solve(Hm, g)
+        w -= step
+        if np.abs(step).max() < 1e-6:
+            break
+    return float(w[0]), float(w[1])
 
 
 def report(rows, title):
@@ -178,6 +198,25 @@ def main():
     report(rows, f"VLM answers vs ground truth ({len(vids)} videos, {a.max_expr} expressions each)")
     for m in methods:
         report([r for r in rows if r["method"] == m], f"method {m}")
+    print("\n## Platt calibration per method. Paste under `rmot:` in configs/rmot_aerialmind.yaml")
+    print("## (ONLY values fitted on --split train may be used for reported results)")
+    print("  calib_by_method:")
+    for m in methods:
+        rs = [r for r in rows if r["method"] == m and r["p"] is not None]
+        if len(rs) < 50:
+            continue
+        cal = {}
+        for k in ("single", "set"):
+            sub = [r for r in rs if (r["group"] == 1) == (k == "single")]
+            if len(sub) < 50 or len({r["truth"] >= 0.5 for r in sub}) < 2:
+                continue
+            pz = np.clip(np.array([r["p"] for r in sub]), 0.02, 0.98)
+            z = np.log(pz / (1 - pz))
+            y = np.array([float(r["truth"] >= 0.5) for r in sub])
+            cal[k] = [round(v, 3) for v in platt(z, y)]
+        print(f"    {m}: {json.dumps(cal)}")
+    if a.split in ("in_domain", "cross_domain", "test"):
+        print("  (fitted on a TEST split: use only to understand the model, not as reported settings)")
     bad = [r for r in rows if r["p"] is None][:3]
     if bad:
         print("\nexamples of unreadable outputs:")

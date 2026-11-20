@@ -13,8 +13,11 @@ Output (one folder per method and lag, official TrackEval layout):
 
 Methods
     search        the method (set-level verifier + window solver + stitching + zoom)
-    search_single ablation: same, single-candidate prompts (group_size 1)
+    search_single same as search with the default group_size 1 (kept for old commands)
+    search_set    ablation: set-level prompt, 8 candidates per call
     search_nolink ablation: no stitching / no link verification
+    search_g4     ablation: 4 candidates per set prompt instead of 8
+    search_nofacts, search_single_nofacts   ablations: without the measured-motion text
     filter_kf     YesTrack-style keyframe filter (per-candidate yes/no, track label propagation)
     filter_ef     every-frame filter (keyframe_every 1)
     filter_set    keyframe filter with set prompts (ablation: verifier without search)
@@ -48,7 +51,11 @@ from edgestream.rmot.verifier import CachedVerifier, FrameSource, OracleVerifier
 METHODS = {
     "search": {"method": "search"},
     "search_single": {"method": "search", "group_size": 1},
+    "search_set": {"method": "search", "group_size": 8},
     "search_nolink": {"method": "search", "link_verify": False, "graph": {"stitch_gap_s": 0.0}},
+    "search_g4": {"method": "search", "group_size": 4},
+    "search_nofacts": {"method": "search", "facts": False},
+    "search_single_nofacts": {"method": "search", "group_size": 1, "facts": False},
     "filter_kf": {"method": "filter"},
     "filter_ef": {"method": "filter", "keyframe_every": 1},
     "filter_set": {"method": "filter", "filter_prompt": "set", "filter_facts": True},
@@ -91,7 +98,9 @@ def build_vlm(cfg: dict, args):
         be = TransformersBackend(**t)
     else:
         raise SystemExit(f"unknown --vlm {kind}")
-    return kind, VLMVerifier(be, overview_width=v.get("overview_width", 1280), facts=v.get("facts", True))
+    return kind, VLMVerifier(be, overview_width=v.get("overview_width", 1280), facts=v.get("facts", True),
+                             prompt=v.get("prompt", "v2"), frame_width=v.get("frame_width", 1024),
+                             crop_h=v.get("crop_h", 160))
 
 
 _W: dict = {}
@@ -182,7 +191,8 @@ def _run_unit(unit) -> list:
         spec = copy.deepcopy(METHODS[m])
         orc_spec = spec.pop("_oracle", None)
         for L in sorted(_W["lags"], key=lambda x: x != INF):
-            rc = RMOTConfig.from_dict(deep_update(_W["base"], {**spec, "lag_s": L}))
+            cal = (_W["base"].get("calib_by_method") or {}).get(m)
+            rc = RMOTConfig.from_dict(deep_update(_W["base"], {**spec, "lag_s": L, **({"calib": cal} if cal else {})}))
             if m.startswith("filter") and L == INF:
                 rc.filter_propagate = "nearest"
             if a["match_compute"] and m != "search" and L == INF and calls_search_inf is not None:

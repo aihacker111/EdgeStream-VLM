@@ -135,6 +135,8 @@ class _FakeChat:
 
     def chat(self, system, parts, max_new_tokens=128, schema=None, top_logprobs=5):
         self.calls.append((system, parts, schema))
+        if schema is None:                       # prompt v2: one token
+            return ChatResult("Yes", [("Yes", {"Yes": math.log(0.7), "No": math.log(0.3)})], 100, 1, 0.1)
         keys = schema["required"]
         txt = "{" + ", ".join(f'"{k}": "yes"' for k in keys) + "}"
         return ChatResult(txt, [(txt, {})], 100, 10, 0.2)
@@ -160,6 +162,30 @@ def test_set_prompt_prefix_is_expression_independent():
         assert k1 == k2 and (np.array_equal(v1, v2) if k1 == "image" else v1 == v2)
     link = ver.link(g, grp[0], grp[1], frames)
     assert list(link.probs.values()) == [1.0]
+
+
+def test_prompt_v2_one_token_and_shared_prefix():
+    perc, aff, sv, _ = make_world(0, n=30)
+    g = TrackletGraph(GraphConfig(fps=10.0))
+    frames = FrameSource(cache=100)
+    for r, fo in enumerate(perc):
+        g.update(r, r / 10.0, fo.tracks, (1280, 720), aff[r])
+        frames.put(r, np.random.default_rng(r).integers(0, 255, (720, 1280, 3), dtype=np.uint8))
+    cands = [s for s in g.segs.values() if s.obs[0].rank <= 20 <= s.obs[-1].rank][:3]
+    be = _FakeChat()
+    ver = VLMVerifier(be, prompt="v2")
+    answers = [ver.refer(g, [s], 20, "red cars", frames) for s in cands]
+    assert all(abs(a.probs[s.sid] - 0.7) < 1e-9 for a, s in zip(answers, cands))
+    calls = [c[1] for c in be.calls]
+    assert all(c[2] is None for c in be.calls)                       # no JSON schema: one token
+    # frame image + description are the identical prefix of every candidate's prompt
+    for parts in calls[1:]:
+        assert parts[0] == calls[0][0] and parts[2] == calls[0][2]
+        assert parts[1][1] is calls[0][1][1]                         # same (cached) frame array
+        assert parts[3][1] is not calls[0][3][1]                     # candidate close-ups differ
+    assert "red cars" in calls[0][2][1] and calls[0][-1][1].endswith("Answer yes or no.")
+    ver1 = VLMVerifier(_FakeChat(), prompt="v1")                     # legacy JSON prompt still works
+    assert set(ver1.refer(g, [cands[0]], 20, "red cars", frames).probs) == {cands[0].sid}
 
 
 def test_cached_verifier_exact_replay(tmp_path):

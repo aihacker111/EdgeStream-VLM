@@ -65,3 +65,5 @@ def test_transformers_backend_runs_an_rmot_set_request(tmp_path):
     ans = v.refer(g, grp, 10, "red cars", frames)
     assert ans.kind == "refer" and ans.prompt_tokens > 0 and ans.latency_s > 0
     assert all(0.0 <= p <= 1.0 for p in ans.probs.values())        # random weights: any answers, valid range
+    one = v.refer(g, grp[:1], 10, "red cars", frames)               # prompt v2: one token, no schema
+    assert one.completion_tokens == 1 and all(0.0 <= p <= 1.0 for p in one.probs.values())

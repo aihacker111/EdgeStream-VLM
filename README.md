@@ -69,10 +69,14 @@ frames ─► AERO-MOT tracks + background affine (ego motion)
 * **Commit at t − L; offline = L = ∞.** Committed frames are never re-written, but committed pieces
   stay in the window as variables so their evidence keeps flowing to new pieces ("frozen outputs,
   live beliefs"). HOTA@L for L ∈ {0, 2, 5, ∞} is the main result curve.
-* **Set-level comparative verifier.** One call judges 8 candidates at once (P(yes) per mark from the
-  token logprobs) and can resolve relative expressions. The expression is the LAST part of the
-  prompt and group composition never depends on the expression, so vLLM's prefix cache serves
-  all queries of a video from the same KV prefix.
+* **Verifier prompt v2 (default).** One candidate per call, answered with ONE token (P(yes) read
+  from the first token's logprobs, no JSON decoding). Layout: unmarked frame (byte-identical for
+  every candidate at that time) -> description -> candidate close-ups [surroundings | zoom | 1 s
+  earlier] + box in 0-1000 coordinates + measured motion. The frame and description are a shared
+  prefix, so the server's prefix cache encodes them once. The keyframe-filter baselines use the
+  same prompt (without the motion text), so search-vs-filter is the only difference.
+  The older set-level prompt (8 marked candidates per call) is kept as the ablation `search_set`:
+  with Qwen3-VL-2B it ranked candidates barely above chance (AUC 0.67 vs 0.94 for one candidate).
 * **Deadline-aware scheduling.** value = Σ 4p(1−p) × frames still uncommitted at completion / (1+answers),
   divided by the time left before the first deadline; requests that cannot finish in time are worth 0.
 * **Test-time scaling knobs**: K answers per piece, R partitions per anchor (`rounds`), group size.
@@ -113,8 +117,9 @@ VLM time; offline, `--match-compute` caps each baseline at the calls the method 
 ```bash
 pip install -e ".[rmot]"                                   # ortools (CP-SAT)
 python scripts/datasets/fetch.py aerialmind --out data/AerialMind        # HF + official seqmaps
-vllm serve Qwen/Qwen3-VL-4B-Instruct --enable-prefix-caching --max-model-len 8192 \
-     --gpu-memory-utilization 0.90 --limit-mm-per-prompt '{"image": 4}' --port 8000      # one 24 GB GPU
+vllm serve Qwen/Qwen3-VL-4B-Instruct-FP8 --enable-prefix-caching --max-model-len 4096 --max-num-seqs 16 \
+     --limit-mm-per-prompt '{"image": 2, "video": 0}' --mm-processor-kwargs '{"max_pixels": 1048576}' \
+     --gpu-memory-utilization 0.60 --port 8000                                            # one 24 GB GPU
 python scripts/rmot_benchmark.py --dataset aerialmind --root data/AerialMind --split in_domain \
      --seqmap data/AerialMind/seqmap.txt --methods search,filter_kf,filter_ef,prior --lags 0,2,5,inf \
      --vlm openai --vlm-url http://localhost:8000/v1 --n-workers 4 --match-compute --out runs/rmot_am_id

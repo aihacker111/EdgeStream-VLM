@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 from ..memory.memory import visual_tokens
-from ..vlm.backends import field_yes_probability
+from ..vlm.backends import field_yes_probability, first_token_yes_probability
 from .tracklets import Segment, TrackletGraph
 
 SYSTEM_SET = (
@@ -40,6 +40,13 @@ SYSTEM_SINGLE = (
     "You judge whether ONE marked object in drone (UAV) or vehicle video matches a referring "
     "expression. The object is marked [1] in the frame and shown in close-ups (left = earliest). "
     "'us', 'we', 'our' mean the drone/camera. Reply only with {\"1\": \"yes\"} or {\"1\": \"no\"}."
+)
+SYSTEM_V2 = (
+    "You verify referring expressions in drone (UAV) or vehicle video. You see the full frame, a "
+    "description, then close-ups of ONE candidate object (left: surroundings with the object boxed, "
+    "middle: zoom, right: the same object a moment earlier) and measured facts about it (camera motion "
+    "removed). Decide whether this candidate matches the description now. 'us', 'we', 'our' mean the "
+    "drone/camera. Answer with one word: yes or no."
 )
 SYSTEM_LINK = (
     "You decide whether two tracked boxes are the SAME physical object. Row A shows the object at "
@@ -240,8 +247,17 @@ def history_crops(g: TrackletGraph, s: Segment, frames: FrameSource, n: int = 3,
 class VLMVerifier:
     """Wraps any backend with a generic ``chat()`` (OpenAI-compatible server or transformers)."""
 
-    def __init__(self, backend, overview_width: int = 1280, facts: bool = True, max_new_tokens: int = 160):
+    def __init__(self, backend, overview_width: int = 1280, facts: bool = True, max_new_tokens: int = 160,
+                 prompt: str = "v2", frame_width: int = 1024, crop_h: int = 160, top_logprobs: int = 10):
+        """``prompt``: v2 (default) = every single-candidate request uses the one-token, shared-prefix
+        prompt (method AND keyframe filter, so the comparison is about search vs filter only);
+        v1 = the original JSON prompts. Groups of several candidates always use the set prompt."""
         self.backend = backend
+        self.prompt = prompt
+        self.frame_width, self.crop_h, self.top_logprobs = frame_width, crop_h, top_logprobs
+        self._frame_cache: OrderedDict = OrderedDict()
+        import threading
+        self._fc_lock = threading.Lock()
         # concurrent calls only make sense for a server (vLLM batches them); a local model is sequential
         self.parallel = getattr(backend, "name", "") in ("openai", "vllm", "ollama") or hasattr(backend, "_post")
         self.overview_width = overview_width
@@ -251,9 +267,76 @@ class VLMVerifier:
     def _cost(self, images: list) -> int:
         return sum(visual_tokens(im.shape[1], im.shape[0]) for im in images)
 
+    # ------------------------------------------------------------------ prompt v2
+    def _frame_image(self, frames: FrameSource, rank: int):
+        """Resized, UNMARKED frame: byte-identical for every request at this anchor, so the server's
+        prefix cache reuses its vision encoding and KV across candidates and expressions."""
+        key = (rank, self.frame_width)
+        with self._fc_lock:
+            if key in self._frame_cache:
+                self._frame_cache.move_to_end(key)
+                return self._frame_cache[key]
+        f = frames.get(rank)
+        if f is None:
+            return None
+        H, W = f.shape[:2]
+        sc = min(1.0, self.frame_width / float(W))
+        img = cv2.resize(f, (int(round(W * sc)), int(round(H * sc))), interpolation=cv2.INTER_AREA) if sc < 1 else f
+        with self._fc_lock:
+            self._frame_cache[key] = img
+            while len(self._frame_cache) > 32:
+                self._frame_cache.popitem(last=False)
+        return img
+
+    def _strip(self, g: TrackletGraph, s: Segment, anchor_rank: int, frames: FrameSource):
+        """[surroundings | zoom | earlier zoom] at a fixed height; small objects are up-scaled."""
+        o = min(s.obs, key=lambda x: abs(x.rank - anchor_rank))
+        track = [x for sid in g.track_of[s.gid] for x in g.segs[sid].obs if x.rank <= anchor_rank]
+        early = min(track, key=lambda x: abs(x.t - (o.t - 1.0))) if track else o
+        tiles = []
+        for ob, ctx, mn in ((o, 2.0, 96), (o, 0.25, 24), (early, 0.25, 24)):
+            f = frames.get(ob.rank)
+            if f is None:
+                continue
+            c = crop(f, ob.box, ctx=ctx, min_side=mn)
+            h, w = c.shape[:2]
+            sc = self.crop_h / float(max(h, 1))
+            tiles.append(cv2.resize(c, (max(8, min(int(w * sc), int(1.6 * self.crop_h))), self.crop_h),
+                                    interpolation=cv2.INTER_CUBIC if sc > 1 else cv2.INTER_AREA))
+            tiles.append(np.full((self.crop_h, 6, 3), 255, np.uint8))
+        return np.concatenate(tiles[:-1], 1) if tiles else None, o, early
+
+    def _refer_v2(self, g: TrackletGraph, s: Segment, anchor_rank: int, expr: str, frames: FrameSource) -> Answer:
+        fr = self._frame_image(frames, anchor_rank)
+        strip, o, early = self._strip(g, s, anchor_rank, frames)
+        W, H = g.image_wh
+        x, y, w, h = [float(v) for v in o.box]
+        b = [int(round(1000 * v)) for v in (x / W, y / H, (x + w) / W, (y + h) / H)]
+        parts = []
+        if fr is not None:
+            parts += [("text", "Frame:"), ("image", fr)]
+        parts.append(("text", f'Description: "{expr}"\nCandidate close-ups:'))     # shared up to here
+        if strip is not None:
+            parts.append(("image", strip))
+        txt = f"Candidate: a {s.cls_name} at box {b} (0-1000 frame coordinates)."
+        if early is not o:
+            txt += f" Right close-up: {o.t - early.t:.1f} s earlier."
+        if self.facts:
+            txt += "\nMeasured: " + candidate_fact("c", s, g).split("] ", 1)[-1] + " " + drone_fact(g)
+        txt += f'\nDoes this {s.cls_name} match "{expr}"? Answer yes or no.'
+        parts.append(("text", txt))
+        res = self.backend.chat(SYSTEM_V2, parts, max_new_tokens=1, schema=None, top_logprobs=self.top_logprobs)
+        p = first_token_yes_probability(res.tokens, res.text)
+        imgs = [im for im in (fr, strip) if im is not None]
+        return Answer("refer", {} if p is None else {s.sid: p}, res.latency_s, res.prompt_tokens,
+                      res.completion_tokens, self._cost(imgs), 1, res.text)
+
+    # ------------------------------------------------------------------ v1 / set prompt
     def refer(self, g: TrackletGraph, group: list, anchor_rank: int, expr: str, frames: FrameSource,
               single: bool = False) -> Answer:
         """``group`` = [Segment]; marks are 1..n in the order given."""
+        if self.prompt == "v2" and len(group) == 1:
+            return self._refer_v2(g, group[0], anchor_rank, expr, frames)
         f = frames.get(anchor_rank)
         marks, rows, facts = [], [], []
         for k, s in enumerate(group, 1):
@@ -385,7 +468,8 @@ class CachedVerifier:
 
     def refer(self, g, group, anchor_rank, expr, frames, single: bool = False) -> Answer:
         keys = [self._seg_key(s) for s in group]
-        k = f"R2|{self.scope}|{expr}|{anchor_rank}|{int(single)}|{int(bool(self.facts))}|{','.join(keys)}"
+        pv = getattr(self.inner, "prompt", "v1") if len(group) == 1 else "set"
+        k = f"R3|{pv}|{self.scope}|{expr}|{anchor_rank}|{int(single)}|{int(bool(self.facts))}|{','.join(keys)}"
         r = self.mem.get(k)
         if r is not None:
             with self._lock:

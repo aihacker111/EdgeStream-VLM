@@ -306,8 +306,15 @@ def _build(dataset: str, split: str, root: str, video_ids: list, seqmap_file: st
 
 def aerialmind(root: str, split: str = "in_domain", seqmap_file: str | None = None,
                label_format: str = "auto", fps: float | None = None) -> RMOTSplit:
-    """``split``: in_domain (VisDrone test sequences) | cross_domain (UAVDT) | <comma list of ids>."""
-    vids = AERIALMIND_TEST.get(split) or [s for s in split.split(",") if s]
+    """``split``: in_domain (VisDrone test sequences) | cross_domain (UAVDT) | train (every other
+    video with expressions: use it for calibration / tuning, never the test splits) | <comma list>."""
+    if split == "train":
+        test = set(AERIALMIND_TEST["in_domain"]) | set(AERIALMIND_TEST["cross_domain"])
+        er = _find_expression_root(root)
+        vids = sorted(d for d in os.listdir(er) if os.path.isdir(os.path.join(er, d)) and d not in test
+                      and not d.startswith((".", "__")))
+    else:
+        vids = AERIALMIND_TEST.get(split) or [s for s in split.split(",") if s]
     sp = _build("aerialmind", split, root, vids, seqmap_file, label_format, fps)
     want = AERIALMIND_SEQMAP_ROWS.get(split)
     if want and len(sp.seqmap) != want and len(sp.videos) == len(vids):

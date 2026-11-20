@@ -10,7 +10,7 @@ rmot:
   lag_s: 2.0                    # commit lag L (overridden by --lags); inf = offline
   window_s: 12.0                # solver window W
   reopt_s: 0.5                  # re-optimise every 0.5 s
-  group_size: 8                 # candidates per set-level prompt
+  group_size: 1                 # 1 = one candidate per call (prompt v2); >1 = set prompt (ablation search_set)
   rounds: 2                     # R: partitions per anchor (each candidate compared with different neighbours)
   k_answers: 2                  # K: answers wanted per piece
   anchor_s: 0.5
@@ -55,14 +55,18 @@ rmot:
 
 vlm:
   backend: openai               # openai (vLLM/SGLang server) | transformers | oracle
-  overview_width: 1280
-  facts: true
+  prompt: v2                    # v2: one-token yes/no, shared prefix (frame -> description -> candidate)
+  frame_width: 1024             # resized frame shown first (identical bytes -> prefix-cached on the server)
+  crop_h: 160                   # height of the close-up strip (small objects are up-scaled)
+  overview_width: 1280          # set prompt (v1) only
+  facts: true                   # measured-motion text for the method (the keyframe filter never sees it)
   openai:
     base_url: http://localhost:8000/v1
-    model: Qwen/Qwen3-VL-4B-Instruct
+    model: Qwen/Qwen3-VL-4B-Instruct-FP8   # or Qwen/Qwen3.5-4B, Qwen/Qwen3-VL-2B-Instruct (must match `vllm serve`)
+    chat_template_kwargs: {enable_thinking: false}   # Qwen3.5: no reasoning tokens
     timeout_s: 120
   transformers:
-    model_id: Qwen/Qwen3-VL-4B-Instruct
+    model_id: Qwen/Qwen3-VL-4B-Instruct      # FP8 checkpoints load in vLLM/SGLang, not in transformers
     device: auto
     dtype: auto
   oracle:                       # NOT a VLM: GT answers with errors (plumbing / ceiling only)

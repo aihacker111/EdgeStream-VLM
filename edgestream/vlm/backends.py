@@ -38,6 +38,28 @@ class ChatResult:
     latency_s: float
 
 
+def first_token_yes_probability(tokens: list, text: str = "") -> float | None:
+    """P(yes) / (P(yes) + P(no)) from the alternatives of the first generated token (one-token
+    yes/no answers). Falls back to the decoded text (1.0 / 0.0); None if neither is readable."""
+    if tokens:
+        tok, alts = tokens[0]
+        py = pn = 0.0
+        for a, lp in (alts or {tok: 0.0}).items():
+            w = a.strip().strip('"').strip(".").lower()
+            if w in ("yes", "y", "ye"):
+                py += math.exp(lp)
+            elif w in ("no", "n"):
+                pn += math.exp(lp)
+        if py + pn > 0:
+            return py / (py + pn)
+    w = (text or "".join(t for t, _ in tokens or [])).strip().strip('"').strip(".").lower()
+    if w.startswith("yes"):
+        return 1.0
+    if w.startswith("no"):
+        return 0.0
+    return None
+
+
 def field_yes_probability(tokens: list, keys: list, yes: str = "yes", no: str = "no") -> dict:
     """P(yes) / (P(yes) + P(no)) at the value of each JSON field ``"<key>": "yes|no"``.
 
@@ -162,10 +184,13 @@ class OpenAICompatBackend(VLMBackend):
     name = "openai"
 
     def __init__(self, base_url: str, model: str, api_key: str = "EMPTY", timeout_s: float = 120.0,
-                 use_schema: bool = True, logprobs: bool = True, temperature: float = 0.0):
+                 use_schema: bool = True, logprobs: bool = True, temperature: float = 0.0,
+                 chat_template_kwargs: dict | None = None):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model, self.api_key, self.timeout = model, api_key, timeout_s
         self.use_schema, self.logprobs, self.temperature = use_schema, logprobs, temperature
+        # Qwen3.5 / hybrid-thinking models: no reasoning tokens (templates without the flag ignore it)
+        self.chat_template_kwargs = {"enable_thinking": False} if chat_template_kwargs is None else chat_template_kwargs
 
     def _payload(self, req: VLMRequest) -> dict:
         content = []
@@ -199,6 +224,8 @@ class OpenAICompatBackend(VLMBackend):
                    {"type": "image_url", "image_url": {"url": _jpeg_data_url(v)}} for k, v in parts]
         body = {"model": self.model, "temperature": self.temperature, "max_tokens": max_new_tokens,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}]}
+        if self.chat_template_kwargs:
+            body["chat_template_kwargs"] = self.chat_template_kwargs
         t0 = time.perf_counter()
         while True:
             b = dict(body)
@@ -324,7 +351,8 @@ class TransformersBackend(VLMBackend):
         messages = [{"role": "system", "content": [{"type": "text", "text": system}]},
                     {"role": "user", "content": content}]
         inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
-                                                    return_dict=True, return_tensors="pt").to(self.device)
+                                                    return_dict=True, return_tensors="pt",
+                                                    enable_thinking=False).to(self.device)
         t0 = time.perf_counter()
         with self.torch.inference_mode():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
