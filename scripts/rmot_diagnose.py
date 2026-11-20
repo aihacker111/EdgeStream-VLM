@@ -157,6 +157,9 @@ def main():
     base["zoom"] = False
     split = load_split(a.dataset, a.root, a.split, a.seqmap, fps=fps)
     vids = list(split.videos)[: a.max_videos]
+    if not vids:
+        sys.exit(f"no video of {a.dataset}/{a.split} found under {a.root}. If --split train is not "
+                 f"recognised, edgestream/rmot/datasets.py on this machine is outdated (sync it).")
     cache_root = a.perception_cache or os.path.join(os.path.dirname(os.path.abspath(a.out)), "perception_cache", a.dataset)
     os.makedirs(a.out, exist_ok=True)
     args = argparse.Namespace(vlm=a.vlm, vlm_url=a.vlm_url, vlm_model=a.vlm_model)
