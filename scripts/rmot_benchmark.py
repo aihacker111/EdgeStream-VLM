@@ -212,6 +212,8 @@ def main():
     ap.add_argument("--split", default="in_domain", help="in_domain | cross_domain | test | comma list of videos")
     ap.add_argument("--seqmap", default=None, help="official seqmap file (rows video+expression)")
     ap.add_argument("--config", default=None)
+    ap.add_argument("--label-format", default="auto", choices=["auto", "x1y1wh", "cxcywh"],
+                    help="AerialMind labels_with_ids box convention (auto: VisDrone x1y1wh, UAVDT cxcywh)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--methods", default="search,filter_kf,filter_ef,prior")
     ap.add_argument("--lags", default="0,2,5,inf")
@@ -254,7 +256,8 @@ def main():
             raise SystemExit(f"unknown method {m}; choose from {list(METHODS)}")
     lags = [INF if s.strip() in ("inf", "offline") else float(s) for s in a.lags.split(",")]
 
-    split = load_split(a.dataset, a.root, a.split, a.seqmap, fps=fps)
+    kw = {"label_format": a.label_format} if a.dataset == "aerialmind" else {}
+    split = load_split(a.dataset, a.root, a.split, a.seqmap, fps=fps, **kw)
     vids = list(split.videos)[: a.max_videos] if a.max_videos else list(split.videos)
     if not vids:
         raise SystemExit(f"no test videos of {a.dataset}/{a.split} under {a.root}")

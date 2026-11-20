@@ -199,7 +199,10 @@ def _index(root: str) -> dict:
         if "labels_with_ids" in low and has_txt:
             out.setdefault(name, {})["labels"] = d
         elif has_img and "labels" not in low:
-            out.setdefault(name, {}).setdefault("images", d)
+            e = out.setdefault(name, {})
+            # KITTI has training/image_02/0005 AND testing/image_02/0005: the RMOT labels belong to training
+            if "images" not in e or ("testing" in e["images"].lower() and "testing" not in low):
+                e["images"] = d
     return out
 
 

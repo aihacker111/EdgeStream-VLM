@@ -49,6 +49,49 @@ def unzip_once(z: Path, dest: Path) -> None:
     marker.touch()
 
 
+def _describe(z: Path) -> str:
+    size = z.stat().st_size
+    with open(z, "rb") as f:
+        head = f.read(64)
+    kind = "zip" if head[:2] == b"PK" else "7z" if head[:6] == b"7z\xbc\xaf\x27\x1c" else \
+        "rar" if head[:4] == b"Rar!" else "gzip" if head[:2] == b"\x1f\x8b" else \
+        "git-lfs/xet pointer (text, not the data)" if head.startswith(b"version https://git-lfs") else \
+        "html (an error page, not the data)" if head.lstrip().lower().startswith((b"<!doctype", b"<html")) else "unknown"
+    return f"{size / 1e9:.2f} GB, header looks like: {kind}"
+
+
+def _split_parts(z: Path) -> list:
+    """Other volumes of a split archive (name.z01.., name.zip.001.., name.7z.001.., name.partN.rar)."""
+    stem = re.sub(r"\.(zip|7z|rar)(\.\d+)?$|\.z\d\d$|\.part\d+$", "", z.name, flags=re.I)
+    return sorted(p for p in z.parent.iterdir() if p != z and p.name.startswith(stem) and
+                  re.search(r"\.(z\d\d|zip\.\d+|7z\.\d+|part\d+(\.rar)?|\d{3})$", p.name, re.I))
+
+
+def _cli_extract(z: Path, dest: Path) -> bool:
+    """7z handles split zip/7z/rar volumes; unzip handles what Python's zipfile refuses."""
+    if shutil.which("7z") or shutil.which("7za"):
+        exe = shutil.which("7z") or shutil.which("7za")
+        return subprocess.run([exe, "x", "-y", f"-o{dest}", str(z)]).returncode == 0
+    if z.name.lower().endswith(".zip") and shutil.which("unzip") and not _split_parts(z):
+        return subprocess.run(["unzip", "-o", "-q", str(z), "-d", str(dest)]).returncode == 0
+    if z.name.lower().endswith(".zip") and shutil.which("zip") and _split_parts(z):
+        full = z.with_name(z.stem + ".joined_tmp.zip")      # zip --out appends .zip otherwise
+        try:
+            if subprocess.run(["zip", "-q", "-s", "0", str(z), "--out", str(full)]).returncode != 0:
+                return False
+            if shutil.which("unzip"):          # python's zipfile rejects re-joined archives ("overlapped entries")
+                return subprocess.run(["unzip", "-o", "-q", str(full), "-d", str(dest)]).returncode == 0
+            with zipfile.ZipFile(full) as f:
+                f.extractall(dest)
+            return True
+        except (zipfile.BadZipFile, OSError):
+            return False
+        finally:
+            if full.exists():
+                full.unlink()
+    return False
+
+
 # ---------------------------------------------------------------------------------------- referring MOT
 AERIALMIND_HF = "shawnliang0420/AerialMind"
 AERIALMIND_GIT = "https://github.com/shawnliang420/AerialMind.git"
@@ -58,38 +101,102 @@ KITTI_IMAGES = "https://s3.eu-central-1.amazonaws.com/avg-kitti/data_tracking_im
 
 
 def _extract_archives(root: Path) -> None:
+    """Extract every archive under ``root`` once (marker files). Never aborts on one bad file:
+    split volumes and formats Python cannot read go to 7z / unzip; what still fails is reported."""
     import tarfile
+    failed, done_split = [], set()
     for z in sorted(root.rglob("*")):
-        if not z.is_file():
+        if not z.is_file() or ".cache" in z.parts or z.name.startswith(".unzipped_") or z.name.startswith(".untarred_"):
             continue
         n = z.name.lower()
-        if n.endswith(".zip"):
-            unzip_once(z, z.parent)
-        elif n.endswith((".tar", ".tar.gz", ".tgz")):
-            marker = z.parent / f".untarred_{z.name}"
-            if not marker.exists():
+        is_vol = re.search(r"\.(z\d\d|zip\.\d+|7z\.\d+|part\d+\.rar|\d{3})$", n)
+        if is_vol:                                   # secondary volume: extracted through its first part
+            continue
+        if not n.endswith((".zip", ".7z", ".rar", ".tar", ".tar.gz", ".tgz")):
+            continue
+        marker = z.parent / f".unzipped_{z.name}"
+        if marker.exists():
+            continue
+        try:
+            if n.endswith(".zip") and not _split_parts(z):
+                unzip_once(z, z.parent)
+                continue
+            if n.endswith((".tar", ".tar.gz", ".tgz")):
                 log(f"untar {z.name}")
                 with tarfile.open(z) as t:
                     t.extractall(z.parent)
                 marker.touch()
-        elif n.endswith((".7z", ".rar")) or re.search(r"\.(z\d\d|7z\.\d+|part\d+)$", n):
-            log(f"{z} is a {n.rsplit('.', 1)[-1]} archive: extract it manually (7z x)")
+                continue
+            raise zipfile.BadZipFile("needs an external extractor")
+        except (zipfile.BadZipFile, NotImplementedError, tarfile.TarError, OSError) as e:
+            parts = _split_parts(z)
+            log(f"{z.name}: python cannot extract it ({e}); {_describe(z)}"
+                + (f"; split archive with {len(parts) + 1} volumes" if parts else ""))
+            if _cli_extract(z, z.parent):
+                marker.touch()
+                done_split.add(z.name)
+                log(f"extracted {z.name} with an external tool")
+            else:
+                failed.append(z)
+    # first volumes named .zip.001 / .7z.001 (no plain .zip): extract via 7z
+    for z in sorted(root.rglob("*.001")):
+        marker = z.parent / f".unzipped_{z.name}"
+        if marker.exists() or ".cache" in z.parts:
+            continue
+        log(f"split archive {z.name}: extracting with 7z")
+        if _cli_extract(z, z.parent):
+            marker.touch()
+        else:
+            failed.append(z)
+    if failed:
+        log("COULD NOT EXTRACT:")
+        for z in failed:
+            log(f"   {z}  ({_describe(z)})")
+        log("Fix: install 7-Zip (sudo apt install p7zip-full, or conda install -c conda-forge p7zip) and rerun; "
+            "if a file is a pointer/html or much smaller than on the Hub, delete it and rerun to re-download.")
 
 
 def _git_file(repo: str, rel: list, dest: Path) -> None:
-    """Shallow-clone a GitHub repo into third_party/ and copy files out of it."""
-    tp = Path("third_party") / repo.rstrip("/").split("/")[-1].replace(".git", "")
-    if not tp.exists():
-        tp.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "clone", "--depth", "1", repo, str(tp)], check=True)
+    """Fetch single files of a GitHub repo (raw download; no clone).
+
+    Cloning is avoided on purpose: some repos contain paths that NTFS/exFAT disks cannot hold
+    (e.g. the AerialMind repo has a folder named "Annotation " with a trailing space), which makes
+    ``git clone`` fail at checkout. Fallback: sparse checkout of exactly the requested files."""
+    import urllib.request
+    owner_repo = repo.rstrip("/").removesuffix(".git").split("github.com/")[-1]
     dest.mkdir(parents=True, exist_ok=True)
+    missing = []
     for r in rel:
-        src = tp / r
-        if src.is_file():
-            shutil.copy(src, dest / src.name)
-            log(f"{src} -> {dest / src.name}")
-        else:
-            log(f"WARNING {src} not found in {repo}")
+        out = dest / Path(r).name
+        ok = False
+        for branch in ("main", "master"):
+            url = f"https://raw.githubusercontent.com/{owner_repo}/{branch}/{r}"
+            try:
+                with urllib.request.urlopen(url, timeout=60) as resp:
+                    out.write_bytes(resp.read())
+                log(f"{url} -> {out}")
+                ok = True
+                break
+            except Exception:                                   # noqa: BLE001
+                continue
+        if not ok:
+            missing.append(r)
+    if not missing:
+        return
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:                  # temp dir lives on the system disk
+        tp = Path(td) / "repo"
+        log(f"raw download failed for {missing}; sparse checkout of {repo}")
+        subprocess.run(["git", "clone", "--depth", "1", "--filter=blob:none", "--no-checkout", repo, str(tp)], check=True)
+        subprocess.run(["git", "-C", str(tp), "sparse-checkout", "set", "--no-cone", *missing], check=True)
+        subprocess.run(["git", "-C", str(tp), "checkout"], check=True)
+        for r in missing:
+            src = tp / r
+            if src.is_file():
+                shutil.copy(src, dest / src.name)
+                log(f"{src.name} -> {dest / src.name}")
+            else:
+                log(f"WARNING {r} not found in {repo}")
 
 
 def cmd_aerialmind(a) -> None:
