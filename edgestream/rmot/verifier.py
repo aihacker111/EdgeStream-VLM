@@ -310,6 +310,12 @@ class VLMVerifier:
         fr = self._frame_image(frames, anchor_rank)
         strip, o, early = self._strip(g, s, anchor_rank, frames)
         W, H = g.image_wh
+        if self.prompt == "v2m" and fr is not None:          # ablation: candidate boxed on the frame
+            fr = fr.copy()                                     # (better grounding, no shared prefix)
+            sc = fr.shape[1] / float(W)
+            x0, y0, x1, y1 = [int(v * sc) for v in (o.box[0], o.box[1], o.box[0] + o.box[2], o.box[1] + o.box[3])]
+            pad = 3
+            cv2.rectangle(fr, (x0 - pad, y0 - pad), (x1 + pad, y1 + pad), (0, 0, 255), 2)
         x, y, w, h = [float(v) for v in o.box]
         b = [int(round(1000 * v)) for v in (x / W, y / H, (x + w) / W, (y + h) / H)]
         parts = []
@@ -335,7 +341,7 @@ class VLMVerifier:
     def refer(self, g: TrackletGraph, group: list, anchor_rank: int, expr: str, frames: FrameSource,
               single: bool = False) -> Answer:
         """``group`` = [Segment]; marks are 1..n in the order given."""
-        if self.prompt == "v2" and len(group) == 1:
+        if self.prompt in ("v2", "v2m") and len(group) == 1:
             return self._refer_v2(g, group[0], anchor_rank, expr, frames)
         f = frames.get(anchor_rank)
         marks, rows, facts = [], [], []

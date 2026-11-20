@@ -90,19 +90,36 @@ def auc(y, s):
     return float((ranks[y].sum() - npos * (npos + 1) / 2) / (npos * (len(y) - npos)))
 
 
-def platt(z, y, l2: float = 1e-3, iters: int = 50):
-    """Fit P(truth) = sigmoid(a * z + b) by Newton's method (z = logit of the VLM's P(yes))."""
+def platt(z, y, l2: float = 1.0, iters: int = 100):
+    """Fit P(truth) = sigmoid(a * z + b) (z = logit of the VLM's P(yes)) by damped Newton steps with
+    a backtracking line search on the L2-penalised log-likelihood: stable even when the VLM's
+    probabilities are saturated (many identical z), where plain Newton diverges."""
+    z, y = np.asarray(z, float), np.asarray(y, float)
     X = np.stack([z, np.ones_like(z)], 1)
+
+    def loss(w):
+        t = X @ w
+        return float(np.sum(np.logaddexp(0, t) - y * t) + 0.5 * l2 * w @ w)
     w = np.array([1.0, 0.0])
+    f = loss(w)
     for _ in range(iters):
-        p = 1 / (1 + np.exp(-np.clip(X @ w, -30, 30)))
-        g = X.T @ (p - y) + l2 * w
-        Hm = (X * (p * (1 - p))[:, None]).T @ X + l2 * np.eye(2)
+        pr = 1 / (1 + np.exp(-np.clip(X @ w, -30, 30)))
+        g = X.T @ (pr - y) + l2 * w
+        Hm = (X * (pr * (1 - pr))[:, None]).T @ X + l2 * np.eye(2)
         step = np.linalg.solve(Hm, g)
-        w -= step
-        if np.abs(step).max() < 1e-6:
+        t = 1.0
+        while t > 1e-6:
+            w2 = w - t * step
+            f2 = loss(w2)
+            if f2 <= f:
+                break
+            t /= 2
+        if f - f2 < 1e-9:
+            w = w2 if f2 <= f else w
             break
-    return float(w[0]), float(w[1])
+        w, f = w2, f2
+    a, b = float(np.clip(w[0], -10, 10)), float(np.clip(w[1], -20, 20))
+    return a, b
 
 
 def report(rows, title):
@@ -131,6 +148,92 @@ def report(rows, title):
               f"{rc:.2f} | {f1:.2f} | {auc(y, p):.3f} | {bt:.2f} ({prf(bt)[3]:.2f}) |")
 
 
+def probe(a, split, vids, cache_root, fps, cached, ver):
+    """Ask every prompt variant on the same fixed candidates (no scheduler, no solver)."""
+    import random
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from edgestream.rmot.expression import parse
+    from edgestream.rmot.tracklets import GraphConfig, TrackletGraph
+    variants = [v.strip() for v in a.variants.split(",") if v.strip()]
+    rng = random.Random(0)
+    jobs = []                                    # (video, expr, graph, segment, anchor, truth, frames)
+    for vid in vids:
+        video = split.videos[vid]
+        W, Hh = video.image_wh
+        if a.tracks_dir:
+            perc, aff = load_mot_tracks(os.path.join(a.tracks_dir, f"{vid}.txt"), len(video), (Hh, W), fps)
+        else:
+            perc, aff = load_perception(cache_root, vid)
+        g = TrackletGraph(GraphConfig(fps=fps))
+        for r, fo in enumerate(perc):
+            if fo is not None:
+                g.update(r, r / fps, fo.tracks, (W, Hh), aff[r] if aff else None)
+        frames = FrameSource(video.frames, cache=256)
+        for expr in split.expressions[vid][: a.max_expr]:
+            q = parse(expr.text)
+            oracle = GTOracle(video, expr)
+            segs = [s for s in g.segs.values() if q.class_ok(s.cls_name) and s.n >= 3]
+            lab = [(s, oracle.refer(s)) for s in segs]
+            pos = [x for x in lab if x[1] >= 0.5]
+            neg = [x for x in lab if x[1] < 0.5]
+            rng.shuffle(pos)
+            rng.shuffle(neg)
+            k = min(len(pos), a.samples // 2)
+            pick = pos[:k] + neg[: a.samples - k]
+            jobs += [(vid, expr.text, g, s, s.mid().rank, t, frames) for s, t in pick]
+    print(f"probe: {len(jobs)} candidates ({sum(j[5] >= 0.5 for j in jobs)} positive) x {len(variants)} variants",
+          flush=True)
+    rows = []
+    pb = RB.bar(len(jobs) * len(variants), "probe", "q")
+    for var in variants:
+        pv = "v1" if var.startswith("v1") else ("v2m" if var.startswith("v2m") else "v2")
+        facts = "+facts" in var
+        ver.prompt = pv
+        cached.facts = facts
+
+        def ask(j):
+            vid, expr, g, s, anchor, truth, frames = j
+            ans = cached.refer(g, [s], anchor, expr, frames, single=(pv == "v1"))
+            return j, ans
+        t0 = time.time()
+        by_vid: dict = {}
+        for j in jobs:
+            by_vid.setdefault(j[0], []).append(j)
+        for vid, js in by_vid.items():
+            cached.scope = vid
+            with ThreadPoolExecutor(max(1, a.threads)) as ex:
+                for j, ans in ex.map(ask, js):
+                    rows.append({"variant": var, "video": vid, "expr": j[1], "kind": var, "group": 1,
+                                 "cls": j[3].cls_name, "p": ans.probs.get(j[3].sid), "truth": j[5],
+                                 "latency": ans.latency_s, "prompt_tokens": ans.prompt_tokens,
+                                 "raw": (ans.text or "")[:80]})
+                    pb.update(1)
+        pb.set_postfix_str(f"{var} done in {time.time() - t0:.0f}s")
+    pb.close()
+    cached.close()
+    with open(os.path.join(a.out, "probe_answers.jsonl"), "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    report(rows, f"PROBE: same {len(jobs)} candidates for every variant ({len(vids)} videos, "
+                 f"{a.max_expr} expressions each)")
+    print("\n| variant | mean latency (s) | mean prompt tokens | saturated p (<=.02 or >=.98) |")
+    print("|---|---|---|---|")
+    for var in variants:
+        rs = [r for r in rows if r["variant"] == var and r["p"] is not None]
+        if rs:
+            sat = np.mean([(r["p"] <= 0.02 or r["p"] >= 0.98) for r in rs])
+            print(f"| {var} | {np.mean([r['latency'] for r in rs]):.3f} | {np.mean([r['prompt_tokens'] for r in rs]):.0f} | {sat:.0%} |")
+    print("\nPlatt per variant (fit on --split train only):")
+    for var in variants:
+        rs = [r for r in rows if r["variant"] == var and r["p"] is not None]
+        if len(rs) >= 50 and len({r["truth"] >= 0.5 for r in rs}) == 2:
+            pz = np.clip(np.array([r["p"] for r in rs]), 0.02, 0.98)
+            ab = platt(np.log(pz / (1 - pz)), np.array([float(r["truth"] >= 0.5) for r in rs]))
+            print(f"  {var}: [{ab[0]:.3f}, {ab[1]:.3f}]")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", default="aerialmind", choices=["aerialmind", "refer_kitti_v2", "refer_kitti"])
@@ -147,6 +250,15 @@ def main():
     ap.add_argument("--max-expr", type=int, default=5)
     ap.add_argument("--perception-cache", default=None)
     ap.add_argument("--tracks-dir", default=None, help="external MOT tracks <dir>/<video_id>.txt")
+    ap.add_argument("--mode", default="replay", choices=["replay", "probe"],
+                    help="replay: run the methods and grade the answers they asked for; probe: ask every "
+                         "prompt variant on ONE fixed, class-balanced sample of candidates (apples to apples)")
+    ap.add_argument("--variants", default="v2+facts,v2-facts,v2m+facts,v1-facts,v1+facts",
+                    help="probe: prompt variants. v2 = one-token shared-prefix prompt, v2m = v2 with the "
+                         "candidate boxed on the frame, v1 = the earlier single-candidate prompt (marked "
+                         "frame + gallery + JSON); +/-facts = motion text")
+    ap.add_argument("--samples", type=int, default=40, help="probe: candidates per (video, expression)")
+    ap.add_argument("--threads", type=int, default=8, help="probe: concurrent requests")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     cfg_path = a.config or os.path.join(ROOT, "configs", "rmot_kitti.yaml" if "kitti" in a.dataset else "rmot_aerialmind.yaml")
@@ -176,6 +288,8 @@ def main():
     args = argparse.Namespace(vlm=a.vlm, vlm_url=a.vlm_url, vlm_model=a.vlm_model)
     kind, ver = RB.build_vlm(cfg, args)
     cached = CachedVerifier(ver, os.path.join(a.out, f"vlm_cache_{kind}.jsonl"))
+    if a.mode == "probe":
+        return probe(a, split, vids, cache_root, fps, cached, ver)
     rows = []
     methods = [m.strip() for m in a.methods.split(",") if m.strip()]
     total = sum(min(len(split.expressions[v]), a.max_expr) for v in vids) * len(methods)
