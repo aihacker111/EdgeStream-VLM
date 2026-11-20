@@ -169,6 +169,8 @@ def _run_unit(unit) -> list:
             vc.pop(next(iter(vc)))
     (perc, aff), frames = vc[vid]
     expr = split.expressions[vid][ei]
+    if _W.get("cached") is not None:
+        _W["cached"].scope = vid                 # answer-cache keys include the video
     gt_rows = video.gt_rows(expr)
     oracle = GTOracle(video, expr)
     calls_search_inf = None

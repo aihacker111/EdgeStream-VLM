@@ -343,6 +343,7 @@ class CachedVerifier:
         import threading
         self.inner, self.path = inner, path
         self._lock = threading.Lock()
+        self.scope = ""                 # video id: the same expression/track ids recur across videos
         self.mem: dict = {}
         self.hits = self.misses = 0
         if path and os.path.isfile(path):
@@ -384,7 +385,7 @@ class CachedVerifier:
 
     def refer(self, g, group, anchor_rank, expr, frames, single: bool = False) -> Answer:
         keys = [self._seg_key(s) for s in group]
-        k = f"R|{expr}|{anchor_rank}|{int(single)}|{int(bool(self.facts))}|{','.join(keys)}"
+        k = f"R2|{self.scope}|{expr}|{anchor_rank}|{int(single)}|{int(bool(self.facts))}|{','.join(keys)}"
         r = self.mem.get(k)
         if r is not None:
             with self._lock:
@@ -398,7 +399,7 @@ class CachedVerifier:
         return ans
 
     def link(self, g, a, b, frames) -> Answer:
-        k = f"L|{self._seg_key(a)}|{self._seg_key(b)}"
+        k = f"L2|{self.scope}|{self._seg_key(a)}|{self._seg_key(b)}"
         r = self.mem.get(k)
         if r is not None:
             with self._lock:
