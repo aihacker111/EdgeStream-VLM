@@ -30,7 +30,8 @@ def has_cache(root: str, video_id: str, n_frames: int) -> bool:
 
 
 def run_perception(frame_paths: list, perceptor, out_root: str, video_id: str, fps: float,
-                   ego_mode: str = "flow", save_emb: bool = True, progress: bool = True) -> None:
+                   ego_mode: str = "flow", save_emb: bool = True, progress: bool = True, pbar=None) -> None:
+    """``pbar``: optional tqdm-like bar, advanced by one per frame (replaces the periodic prints)."""
     import cv2
     from ..scene.ego_motion import EgoMotionEstimator
     d = cache_dir(out_root, video_id)
@@ -54,7 +55,9 @@ def run_perception(frame_paths: list, perceptor, out_root: str, video_id: str, f
                 for t in out.tracks:
                     if t.embedding is not None and np.size(t.embedding) > 1:
                         embs[f"{r}_{t.global_id}"] = np.asarray(t.embedding, np.float16)
-            if progress and r % 200 == 0:
+            if pbar is not None:
+                pbar.update(1)
+            elif progress and r % 200 == 0:
                 print(f"    [{video_id}] perception {r}/{len(frame_paths)}", flush=True)
     if save_emb and embs:
         np.savez_compressed(os.path.join(d, "emb.npz"), **embs)

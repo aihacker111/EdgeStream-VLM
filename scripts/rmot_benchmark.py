@@ -97,6 +97,46 @@ def build_vlm(cfg: dict, args):
 _W: dict = {}
 
 
+class _NoBar:
+    """Stand-in when tqdm is missing: prints a line every ~30 s."""
+
+    def __init__(self, total=None, desc="", unit="it", **_):
+        self.total, self.desc, self.unit, self.n, self._t = total, desc, unit, 0, time.time()
+        self.post = ""
+
+    def update(self, k=1):
+        self.n += k
+        if time.time() - self._t > 30 or self.n == self.total:
+            self._t = time.time()
+            print(f"{self.desc}: {self.n}/{self.total} {self.unit} {self.post}", flush=True)
+
+    def set_postfix_str(self, s, refresh=True):
+        self.post = s
+
+    def set_description(self, d, refresh=True):
+        self.desc = d
+
+    def reset(self, total=None):
+        self.n, self.total = 0, total
+
+    def write(self, s):
+        print(s, flush=True)
+
+    def close(self):
+        pass
+
+
+def bar(total, desc, unit, leave=True, position=0):
+    """tqdm progress bar; refreshes rarely when the output is a log file (``| tee``) so logs stay small."""
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return _NoBar(total=total, desc=desc, unit=unit)
+    tty = sys.stderr.isatty()
+    return tqdm(total=total, desc=desc, unit=unit, leave=leave, position=position, dynamic_ncols=True,
+                mininterval=0.5 if tty else 30, smoothing=0.05, file=sys.stderr)
+
+
 def _init_worker(state: dict, split) -> None:
     """Per-process state: verifier (+ answer cache), zoom detector, perception of the current video."""
     import argparse as _ap
@@ -133,6 +173,8 @@ def _run_unit(unit) -> list:
     oracle = GTOracle(video, expr)
     calls_search_inf = None
     out_stats = []
+    if _W.get("on_unit"):
+        _W["on_unit"]()
     order = sorted(_W["methods"], key=lambda m: m != "search")      # the method first (compute matching)
     for m in order:
         spec = copy.deepcopy(METHODS[m])
@@ -150,6 +192,8 @@ def _run_unit(unit) -> list:
                 ver = _W["cached"]
             t0 = time.time()
             res = OnlineRMOT(rc, ver, zoom_detect=_W["zoom"]).run(perc, expr.text, fps, (W, Hh), frames, aff)
+            if _W.get("on_run"):
+                _W["on_run"](f"{vid} | {m}@L{lag_name(L)}")
             if m == "search" and L == INF:
                 calls_search_inf = res["stats"]["vlm"]["calls"]
             d = os.path.join(a["out"], f"{m}_L{lag_name(L)}")
@@ -276,14 +320,18 @@ def main():
     # ---- phase 1: perception once per video (GPU, sequential)
     if not a.tracks_dir:
         perceptor = None
-        for vi, vid in enumerate(vids):
-            video = split.videos[vid]
-            if not has_cache(cache_root, vid, len(video)):
+        need = [v for v in vids if not has_cache(cache_root, v, len(split.videos[v]))]
+        if need:
+            pb = bar(sum(len(split.videos[v]) for v in need), "perception", "frame")
+            for vi, vid in enumerate(need):
+                video = split.videos[vid]
                 if perceptor is None:
                     from perception import Perceptor
                     perceptor = Perceptor.from_yaml(os.path.join(ROOT, cfg["perception_config"]))
-                print(f"[{vi + 1}/{len(vids)}] {vid}: perception on {len(video)} frames", flush=True)
-                run_perception(video.frames, perceptor, cache_root, vid, fps)
+                pb.set_postfix_str(f"video {vi + 1}/{len(need)} {vid}")
+                run_perception(video.frames, perceptor, cache_root, vid, fps, pbar=pb)
+            pb.close()
+        print(f"perception cache ready for {len(vids)} videos ({len(vids) - len(need)} were cached)", flush=True)
         del perceptor
     # ---- phase 2: every (video, expression) stream, all methods x lags
     units = []
@@ -311,12 +359,27 @@ def main():
             with open(os.path.join(d, "stats.jsonl"), "a") as f:
                 f.write(json.dumps(st) + "\n")
 
+    pb = bar(len(todo), "streams", "stream")
+    tot = {"calls": 0, "n": 0}
+
+    def after(rows):
+        record(rows)
+        tot["calls"] += sum((r.get("vlm") or {}).get("calls", 0) for r in rows)
+        tot["n"] += 1
+        el = time.time() - t_start
+        hits = f", cache hits {_W['cached'].hits}" if _W.get("cached") else ""
+        pb.set_postfix_str(f"{rows[0]['seq'].split('+')[0] if rows else ''}, {el / tot['n']:.0f}s/stream, "
+                           f"VLM calls {tot['calls']}{hits}")
+        pb.update(1)
+
     if a.jobs <= 1:
         _init_worker(state, split)
-        for n, u in enumerate(todo):
-            record(_run_unit(u))
-            if (n + 1) % 10 == 0 or n + 1 == len(todo):
-                print(f"  {n + 1}/{len(todo)} streams ({(time.time() - t_start) / 60:.1f} min)", flush=True)
+        inner = bar(len(methods) * len(lags), "  runs", "run", leave=False, position=1)
+        _W["on_run"] = lambda label: (inner.set_description(f"  {label}"), inner.update(1))
+        _W["on_unit"] = lambda: inner.reset(total=len(methods) * len(lags))
+        for u in todo:
+            after(_run_unit(u))
+        inner.close()
         if _W.get("cached"):
             _W["cached"].close()
     else:
@@ -325,20 +388,23 @@ def main():
         with ProcessPoolExecutor(a.jobs, mp_context=mp.get_context("spawn"), initializer=_init_worker,
                                  initargs=(state, split)) as ex:
             futs = [ex.submit(_run_unit, u) for u in todo]
-            for n, fu in enumerate(as_completed(futs)):
-                record(fu.result())
-                if (n + 1) % 10 == 0 or n + 1 == len(todo):
-                    print(f"  {n + 1}/{len(todo)} streams ({(time.time() - t_start) / 60:.1f} min)", flush=True)
+            for fu in as_completed(futs):
+                after(fu.result())
+    pb.close()
+    print(f"{tot['n']} streams done in {(time.time() - t_start) / 60:.1f} min, {tot['calls']} VLM calls", flush=True)
 
     seqmap_path = os.path.join(a.out, f"seqmap_{a.split.replace(',', '_')}.txt")
     with open(seqmap_path, "w") as f:
         f.write("".join(s + "\n" for s in evaluated))
     lengths = {v: len(split.videos[v]) for v in vids}
     results = {}
+    pe = bar(len(methods) * len(lags), "HOTA eval", "run")
     for m in methods:
         for L in lags:
             d = os.path.join(a.out, f"{m}_L{lag_name(L)}")
+            pe.set_postfix_str(f"{m}@L{lag_name(L)}")
             r = H.evaluate_folder(d, evaluated, lengths)
+            pe.update(1)
             calls = []
             with open(os.path.join(d, "stats.jsonl")) as f:
                 for line in f:
@@ -347,6 +413,7 @@ def main():
                                               "n_seqs": len(evaluated)}
             with open(os.path.join(d, "per_seq.json"), "w") as f:
                 json.dump(r["per_seq"], f)
+    pe.close()
     with open(os.path.join(a.out, "results.json"), "w") as f:
         json.dump({"dataset": a.dataset, "split": a.split, "vlm": vlm_kind, "results": results}, f, indent=1)
     lines = [f"# {a.dataset} / {a.split} - HOTA@L ({len(evaluated)} sequences, VLM {vlm_kind})", "",
