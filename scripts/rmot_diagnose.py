@@ -34,7 +34,7 @@ import yaml  # noqa: E402
 
 import rmot_benchmark as RB  # noqa: E402
 from edgestream.rmot.datasets import load_split  # noqa: E402
-from edgestream.rmot.perception import has_cache, load_mot_tracks, load_perception  # noqa: E402
+from edgestream.rmot.perception import has_cache, load_mot_tracks, load_perception, run_perception  # noqa: E402
 from edgestream.rmot.pipeline import INF, GTOracle, OnlineRMOT, RMOTConfig  # noqa: E402
 from edgestream.rmot.verifier import CachedVerifier, FrameSource  # noqa: E402
 
@@ -162,6 +162,17 @@ def main():
                  f"recognised, edgestream/rmot/datasets.py on this machine is outdated (sync it).")
     cache_root = a.perception_cache or os.path.join(os.path.dirname(os.path.abspath(a.out)), "perception_cache", a.dataset)
     os.makedirs(a.out, exist_ok=True)
+    if not a.tracks_dir:                         # run AERO-MOT once for videos that have no cache yet
+        need = [v for v in vids if not has_cache(cache_root, v, len(split.videos[v]))]
+        if need:
+            from perception import Perceptor
+            perceptor = Perceptor.from_yaml(os.path.join(ROOT, cfg["perception_config"]))
+            pp = RB.bar(sum(len(split.videos[v]) for v in need), "perception", "frame")
+            for i, v in enumerate(need):
+                pp.set_postfix_str(f"video {i + 1}/{len(need)} {v}")
+                run_perception(split.videos[v].frames, perceptor, cache_root, v, fps, pbar=pp)
+            pp.close()
+            del perceptor
     args = argparse.Namespace(vlm=a.vlm, vlm_url=a.vlm_url, vlm_model=a.vlm_model)
     kind, ver = RB.build_vlm(cfg, args)
     cached = CachedVerifier(ver, os.path.join(a.out, f"vlm_cache_{kind}.jsonl"))
@@ -174,11 +185,8 @@ def main():
         W, Hh = video.image_wh
         if a.tracks_dir:
             perc, aff = load_mot_tracks(os.path.join(a.tracks_dir, f"{vid}.txt"), len(video), (Hh, W), fps)
-        elif has_cache(cache_root, vid, len(video)):
-            perc, aff = load_perception(cache_root, vid)
         else:
-            sys.exit(f"no perception cache for {vid} under {cache_root}: run rmot_benchmark.py first "
-                     f"(or pass --perception-cache)")
+            perc, aff = load_perception(cache_root, vid)
         frames = FrameSource(video.frames, cache=96)
         cached.scope = vid
         for expr in split.expressions[vid][: a.max_expr]:

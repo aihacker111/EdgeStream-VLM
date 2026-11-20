@@ -142,8 +142,17 @@ def bar(total, desc, unit, leave=True, position=0):
     except ImportError:
         return _NoBar(total=total, desc=desc, unit=unit)
     tty = sys.stderr.isatty()
-    return tqdm(total=total, desc=desc, unit=unit, leave=leave, position=position, dynamic_ncols=True,
-                mininterval=0.5 if tty else 30, smoothing=0.05, file=sys.stderr)
+    # piped through `| tee` but a person is at the terminal (stdin is a tty): still refresh every second;
+    # only unattended runs (nohup, cron, background) refresh every 30 s to keep logs small
+    interval = 0.5 if tty else (1.0 if sys.stdin.isatty() else 30)
+    # Some terminals (tmux/screen, IDE or web SSH consoles) report a size of 0 x 0. tqdm then hides
+    # every bar (it thinks the screen has 0 rows) and only blank lines appear. Never trust a 0 size.
+    import shutil
+    size = shutil.get_terminal_size((140, 40))
+    cols = size.columns if size.columns >= 60 else 140
+    rows = size.lines if size.lines >= 10 else 40
+    return tqdm(total=total, desc=desc, unit=unit, leave=leave, position=position, ncols=cols, nrows=rows,
+                mininterval=interval, smoothing=0.05, file=sys.stderr)
 
 
 def _init_worker(state: dict, split) -> None:
