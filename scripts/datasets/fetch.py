@@ -106,7 +106,8 @@ def _extract_archives(root: Path) -> None:
     import tarfile
     failed, done_split = [], set()
     for z in sorted(root.rglob("*")):
-        if not z.is_file() or ".cache" in z.parts or z.name.startswith(".unzipped_") or z.name.startswith(".untarred_"):
+        if (not z.is_file() or ".cache" in z.parts or "__MACOSX" in z.parts or z.name.startswith("._")
+                or z.name.startswith(".unzipped_") or z.name.startswith(".untarred_")):
             continue
         n = z.name.lower()
         is_vol = re.search(r"\.(z\d\d|zip\.\d+|7z\.\d+|part\d+\.rar|\d{3})$", n)
@@ -141,7 +142,7 @@ def _extract_archives(root: Path) -> None:
     # first volumes named .zip.001 / .7z.001 (no plain .zip): extract via 7z
     for z in sorted(root.rglob("*.001")):
         marker = z.parent / f".unzipped_{z.name}"
-        if marker.exists() or ".cache" in z.parts:
+        if marker.exists() or ".cache" in z.parts or "__MACOSX" in z.parts or z.name.startswith("._"):
             continue
         log(f"split archive {z.name}: extracting with 7z")
         if _cli_extract(z, z.parent):

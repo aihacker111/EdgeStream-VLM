@@ -183,7 +183,9 @@ def _walk_dirs(root: str, max_depth: int = 5):
     for d, subdirs, files in os.walk(root, followlinks=True):
         if d.count(os.sep) - base >= max_depth:
             subdirs[:] = []
-        subdirs.sort()
+        # macOS zip debris (__MACOSX/, ._* AppleDouble files) and hidden caches are never data
+        subdirs[:] = sorted(x for x in subdirs if x != "__MACOSX" and not x.startswith("."))
+        files[:] = [f for f in files if not f.startswith("._")]
         yield d, subdirs, files
 
 
@@ -217,7 +219,7 @@ def load_expressions(expr_root: str, video_id: str) -> list[RMOTExpression]:
     d = os.path.join(expr_root, video_id)
     out = []
     for fn in sorted(os.listdir(d)):
-        if not fn.endswith(".json"):
+        if not fn.endswith(".json") or fn.startswith("._"):
             continue
         with open(os.path.join(d, fn)) as f:
             info = json.load(f)
@@ -262,7 +264,7 @@ def _build(dataset: str, split: str, root: str, video_ids: list, seqmap_file: st
         if "images" not in e or not os.path.isdir(os.path.join(expr_root, vid)):
             missing.append(vid)
             continue
-        imgs = sorted(f for f in os.listdir(e["images"]) if f.lower().endswith(IMG_EXT))
+        imgs = sorted(f for f in os.listdir(e["images"]) if f.lower().endswith(IMG_EXT) and not f.startswith("._"))
         keys = [_digits(os.path.splitext(f)[0]) for f in imgs]
         v = RMOTVideo(dataset, vid, e["images"], e.get("labels", ""),
                       [os.path.join(e["images"], f) for f in imgs], keys,
