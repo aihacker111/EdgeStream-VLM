@@ -144,6 +144,8 @@ def main():
     cached = CachedVerifier(ver, os.path.join(a.out, f"vlm_cache_{kind}.jsonl"))
     rows = []
     methods = [m.strip() for m in a.methods.split(",") if m.strip()]
+    total = sum(min(len(split.expressions[v]), a.max_expr) for v in vids) * len(methods)
+    pb = RB.bar(total, "diagnose", "run")
     for vid in vids:
         video = split.videos[vid]
         W, Hh = video.image_wh
@@ -165,8 +167,10 @@ def main():
                 if m.startswith("filter"):
                     rc.filter_propagate = "nearest"
                 rec = Recorder(cached, oracle, vid, expr.text, m, rows)
+                pb.set_postfix_str(f"{vid} | {m} | {expr.text[:40]} | {len(rows)} answers, cache hits {cached.hits}")
                 OnlineRMOT(rc, rec).run(perc, expr.text, fps, (W, Hh), frames, aff)
-            print(f"  {vid} | {expr.text}: {len(rows)} answers so far", flush=True)
+                pb.update(1)
+    pb.close()
     cached.close()
     with open(os.path.join(a.out, "answers.jsonl"), "w") as f:
         for r in rows:
