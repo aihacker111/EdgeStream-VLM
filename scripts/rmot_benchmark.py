@@ -213,7 +213,7 @@ def main():
     ap.add_argument("--seqmap", default=None, help="official seqmap file (rows video+expression)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--label-format", default="auto", choices=["auto", "x1y1wh", "cxcywh"],
-                    help="AerialMind labels_with_ids box convention (auto: VisDrone x1y1wh, UAVDT cxcywh)")
+                    help="labels_with_ids box convention (auto: top-left unless the data clearly says centre)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--methods", default="search,filter_kf,filter_ef,prior")
     ap.add_argument("--lags", default="0,2,5,inf")

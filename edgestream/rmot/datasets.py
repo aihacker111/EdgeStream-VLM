@@ -12,10 +12,10 @@ Both follow the RMOT conventions (Wu et al., CVPR 2023), which this module repro
   (For KITTI's 0-based names this is RMOT's ``int(k) + 1``; for VisDrone's 1-based names it is
   ``int(k)``. Both equal the rank, which is what TrackEval's sequence length assumes.)
 
-Box convention of ``labels_with_ids``: RMOT and AerialMind both read KITTI and VisDrone (``uav``
-in the path) as top-left x,y,w,h and everything else as centre x,y,w,h. ``label_format="auto"``
-follows that rule and :func:`check_label_format` measures which reading keeps boxes inside the
-image, so a wrong guess for UAVDT shows up as a warning instead of a silent 0 HOTA.
+Box convention of ``labels_with_ids``: top-left x,y,w,h for KITTI, VisDrone and UAVDT (checked by
+drawing the real AerialMind labels; the AerialMind loader reads non-VisDrone paths as centre boxes,
+which is wrong for UAVDT). ``label_format="auto"`` uses top-left unless :func:`check_label_format`
+clearly measures centre boxes.
 """
 from __future__ import annotations
 
@@ -92,22 +92,22 @@ class RMOTVideo:
 
     @property
     def fmt(self) -> str:
-        """Box convention of labels_with_ids. ``auto``: measured from the data (the reading that keeps
-        boxes inside the image); the path rule of the RMOT/AerialMind code only breaks ties.
-        Measured on AerialMind: VisDrone and UAVDT are both top-left x,y,w,h (reading UAVDT as
-        centre puts 7-9% of its boxes outside the image)."""
+        """Box convention of labels_with_ids. ``auto``: top-left x,y,w,h unless the data clearly says
+        centre (measured: the reading that keeps boxes inside the image).
+        Checked on the real AerialMind release: VisDrone AND UAVDT are top-left. The AerialMind
+        loader's centre branch for non-'uav' paths is wrong for UAVDT (reading it as centre puts
+        7-9% of the boxes outside the image and shifts every box by half its size, e.g. M0209)."""
         if self.label_format != "auto":
             return self.label_format
         if self._auto_fmt is None:
-            p = (self.label_dir + self.video_id).lower()
-            rule = "x1y1wh" if ("uav" in p or "kitti" in p) else "cxcywh"
+            rule = "x1y1wh"
             chk = check_label_format(self, n_frames=40) if self.label_dir else {"n": 0}
             if chk["n"] and abs(chk["x1y1wh"] - chk["cxcywh"]) > 0.005:
                 self._auto_fmt = chk["best"]
                 if self._auto_fmt != rule:
                     warnings.warn(f"{self.video_id}: labels measured as {self._auto_fmt} "
                                   f"(out-of-image x1y1wh={chk['x1y1wh']:.3f}, cxcywh={chk['cxcywh']:.3f}); "
-                                  f"the path rule would say {rule}. Using {self._auto_fmt}.")
+                                  f"the default is {rule}. Using {self._auto_fmt}.")
             else:
                 self._auto_fmt = rule
         return self._auto_fmt
