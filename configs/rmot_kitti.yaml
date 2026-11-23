@@ -17,6 +17,7 @@ rmot:
   min_ask_s: 0.3
   link_verify: true
   link_band: [0.15, 0.85]
+  cover_weight: 0.85            # coverage first: objects nobody asked about go before re-checks (0 = off)
   prior_base: -1.0
   class_mismatch: -8.0
   kin_weight: 1.0

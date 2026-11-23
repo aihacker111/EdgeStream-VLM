@@ -483,12 +483,19 @@ class TrackletGraph:
         (0 = prior only, 1 = as good as asked). 1.0 for an answered piece."""
         return self._cached_belief(sid)[1]
 
+    def coverage(self, sid: int) -> float:
+        """Like support, counting questions still in flight too: P(this object is already
+        answered or being asked about). The scheduler spends calls on uncovered objects first."""
+        return self._cached_belief(sid)[2]
+
     def _cached_belief(self, sid: int, gamma: float = 0.5) -> tuple:
         memo = getattr(self, "_memo", None)
         if memo is not None and sid in memo:
             return memo[sid]
         if self.cfg.propagation == "hops":
-            v = (self._effective_logit(sid, gamma), 1.0 if self.segs[sid].vlm_logits else 0.0)
+            s = self.segs[sid]
+            mine = 1.0 if s.vlm_logits else 0.0
+            v = (self._effective_logit(sid, gamma), mine, 1.0 if (s.vlm_logits or s.n_asked_pending) else 0.0)
         else:
             v = self._identity_belief(sid)
         if memo is not None:
@@ -504,14 +511,18 @@ class TrackletGraph:
         return sigmoid(self.edge_logit(e))
 
     def _identity_belief(self, sid: int) -> tuple:
+        """(belief logit, support, coverage) of piece ``sid`` from the answers about the same object."""
         s = self.segs[sid]
         if s.vlm_logits:
-            return max(min(self.seg_logit(s), 12.0), -12.0), 1.0
+            return max(min(self.seg_logit(s), 12.0), -12.0), 1.0, 1.0
         # best-path P(same object) to the nearest answered pieces, both directions; the search
-        # stops at an answered piece (it already summarises what lies beyond it)
+        # stops at an answered piece (it already summarises what lies beyond it); pieces with a
+        # question in flight are noted (coverage) and passed through
         best = {sid: 1.0}
         frontier = [sid]
-        found = {}
+        found, pend = {}, {}
+        if s.n_asked_pending:
+            pend[sid] = 1.0
         for _ in range(self.cfg.prop_max_hops):
             nxt = []
             for u in frontier:
@@ -526,23 +537,30 @@ class TrackletGraph:
                     if w < self.cfg.prop_min_w or w <= best.get(v, 0.0):
                         continue
                     best[v] = w
-                    if self.segs[v].vlm_logits:
+                    sv = self.segs[v]
+                    if sv.vlm_logits:
                         found[v] = w
-                    else:
-                        nxt.append(v)
+                        continue
+                    if sv.n_asked_pending:
+                        pend[v] = w
+                    nxt.append(v)
             if not nxt:
                 break
             frontier = nxt
+
+        def p_any(ws):
+            miss = 1.0
+            for w in ws:
+                miss *= 1.0 - w
+            return 1.0 - miss
+        cov = p_any(list(found.values()) + list(pend.values()))
         if not found:
-            return max(min(s.prior_logit, 12.0), -12.0), 0.0
+            return max(min(s.prior_logit, 12.0), -12.0), 0.0, cov
         tot = sum(found.values())
         z_ev = sum(w * self.seg_logit(self.segs[k]) for k, w in found.items()) / tot
-        miss = 1.0
-        for w in found.values():
-            miss *= 1.0 - w
-        sup = 1.0 - miss                                  # P(at least one answer is about this object)
+        sup = p_any(found.values())                       # P(at least one answer is about this object)
         z = sup * z_ev + (1.0 - sup) * s.prior_logit
-        return max(min(z, 12.0), -12.0), sup
+        return max(min(z, 12.0), -12.0), sup, cov
 
     def _effective_logit(self, sid: int, gamma: float = 0.5) -> float:
         s = self.segs[sid]

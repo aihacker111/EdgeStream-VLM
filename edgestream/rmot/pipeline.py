@@ -48,6 +48,10 @@ class RMOTConfig:
     min_ask_s: float = 0.3          # an open segment is asked once it is this long
     link_verify: bool = True
     link_band: tuple = (0.15, 0.85)  # stitch edges with prior p in this band are asked
+    # coverage first: a piece whose object is already answered (or being asked about) is worth
+    # (1 - cover_weight * coverage) of a piece of an object nobody has asked about yet, so a fixed
+    # budget reaches every compatible object before it re-checks known ones (0 = off)
+    cover_weight: float = 0.85
     # prior
     prior_base: float = -1.0
     class_mismatch: float = -8.0
@@ -255,7 +259,7 @@ class OnlineRMOT:
                     key = ("refer", round(at, 3), fam, r, k // G)
                     if key in self.issued:
                         continue
-                    v, dl = 0.0, INF
+                    v, v_raw, dl, cov0 = 0.0, 0.0, INF, 0.0
                     for sid in grp:
                         s = g.segs[sid]
                         if len(s.vlm_logits) + s.n_asked_pending >= c.k_answers:
@@ -265,12 +269,19 @@ class OnlineRMOT:
                         p = sigmoid(g.effective_logit(sid))
                         u = 4 * p * (1 - p)
                         a = self._uncommitted_frames(s, tau)
-                        v += u * a / (1 + len(s.vlm_logits) + s.n_asked_pending)
-                        dl = min(dl, self._deadline(s))
-                    if v <= c.sched.min_value:
+                        cov = g.coverage(sid) if c.cover_weight else 0.0
+                        cov0 = max(cov0, cov)
+                        base = u * a / (1 + len(s.vlm_logits) + s.n_asked_pending)
+                        v_raw += base
+                        v += base * (1.0 - c.cover_weight * cov)    # coverage only ORDERS the queue:
+                        dl = min(dl, self._deadline(s))              # what is worth asking is unchanged
+                    if v_raw <= c.sched.min_value:
                         continue
+                    v = max(v, 1.01 * c.sched.min_value)
                     urg = 1.0 if dl == INF else 1.0 / max(dl - tau, c.sched.eps_s)
-                    reqs.append(Request("refer", key, grp, self._anchor_rank(at), v * urg))
+                    r_ = Request("refer", key, grp, self._anchor_rank(at), v * urg)
+                    r_.cov0 = cov0                       # coverage when valued (see _dispatch)
+                    reqs.append(r_)
         if c.link_verify:
             lo, hi = c.link_band
             for key, e in g.edges.items():
@@ -301,6 +312,17 @@ class OnlineRMOT:
             req = self.pool.pop(0)
             if req.key in self.issued:
                 continue
+            if (req.kind == "refer" and self.cfg.cover_weight and getattr(req, "cov0", 1.0) < 0.5
+                    and g.cfg.propagation != "hops"):
+                # valued when its object was uncovered; a piece of the same object may have been
+                # sent since (the pool is rebuilt every reopt_s): skip it, the next pool re-values it
+                g.clear_memo()
+                try:
+                    now_cov = max(g.coverage(sid) for sid in req.members)
+                finally:
+                    g._memo = None
+                if now_cov >= 0.5:
+                    continue
             self.issued.add(req.key)
             if req.kind == "refer":
                 grp = [g.segs[sid] for sid in req.members]

@@ -388,6 +388,11 @@ def test_identity_propagation_covers_the_track_until_a_suspicious_cut():
     g.edges[key].prior_logit = _logit(0.3)
     assert g.support(last) == 0.0 and g.effective_logit(last) == -1.0
     assert g.support(order[len(order) // 2 - 1]) > 0.9
+    # a question in flight about the same object covers it (scheduler) but is no evidence yet
+    g2 = build("identity")
+    o2 = sorted(g2.segs, key=lambda k: g2.segs[k].t0)
+    g2.segs[o2[0]].n_asked_pending = 1
+    assert g2.coverage(o2[-1]) > 0.9 and g2.support(o2[-1]) == 0.0 and g2.effective_logit(o2[-1]) == -1.0
     # legacy: the answer fades after a few pieces
     h = build("hops")
     order_h = sorted(h.segs, key=lambda k: h.segs[k].t0)
