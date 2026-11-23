@@ -84,6 +84,7 @@ class Segment:
     cut_reason: str = "start"
     # evidence
     prior_logit: float = 0.0
+    kin_score: float = 0.0          # measured-motion score of the query (belief model evidence)
     vlm_logits: list = field(default_factory=list)
     n_asked: int = 0
     n_asked_pending: int = 0

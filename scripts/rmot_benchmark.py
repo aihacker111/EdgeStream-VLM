@@ -310,6 +310,8 @@ def main():
     ap.add_argument("--vlm-model", default=None, help="served model name (openai) or HF id / local folder (transformers)")
     ap.add_argument("--vlm-adapter", default=None, help="transformers: LoRA folder from rmot_train_lora.py (e.g. runs/lora_vl2b/best)")
     ap.add_argument("--vlm-batch", type=int, default=None, help="transformers: max requests per forward pass (default 8)")
+    ap.add_argument("--belief-params", default=None, help="YAML from rmot_fit_belief.py: enables the belief model")
+    ap.add_argument("--no-belief", action="store_true", help="heuristic propagation / coverage instead of the belief model")
     ap.add_argument("--n-workers", type=int, default=None)
     ap.add_argument("--latency-scale", type=float, default=None)
     ap.add_argument("--fixed-latency", type=float, default=None)
@@ -331,6 +333,10 @@ def main():
         cfg = yaml.safe_load(f)
     fps = float(cfg.get("fps", 30))
     base = dict(cfg.get("rmot") or {})
+    if a.belief_params:                          # parameters fitted on train (scripts/rmot_fit_belief.py)
+        with open(a.belief_params) as f:
+            base = deep_update(base, (yaml.safe_load(f) or {}).get("rmot") or {})
+        base.setdefault("belief", {})["enabled"] = True
     base["stride"] = int(cfg.get("stride", 1))
     if a.n_workers:
         base.setdefault("sched", {})["n_workers"] = a.n_workers
@@ -340,6 +346,11 @@ def main():
         base.setdefault("sched", {})["fixed_latency_s"] = a.fixed_latency
     if a.no_zoom:
         base["zoom"] = False
+    if a.no_belief:
+        base.setdefault("belief", {})["enabled"] = False
+    if (base.get("belief") or {}).get("enabled") and not a.belief_params:
+        print("WARNING: belief model with UNFITTED fallback parameters; fit them on the train split with "
+              "scripts/rmot_fit_belief.py and pass --belief-params (or --no-belief for the heuristic)", flush=True)
     methods = [m.strip() for m in a.methods.split(",") if m.strip()]
     for m in methods:
         if m not in METHODS:

@@ -398,3 +398,29 @@ def test_identity_propagation_covers_the_track_until_a_suspicious_cut():
     order_h = sorted(h.segs, key=lambda k: h.segs[k].t0)
     h.segs[order_h[0]].vlm_logits.append(4.0)
     assert h.effective_logit(order_h[-1]) < 0.0
+
+
+def test_fit_belief_then_benchmark(tmp_path):
+    """rmot_fit_belief.py on synthetic TRAIN videos -> YAML -> rmot_benchmark.py --belief-params."""
+    import yaml as _yaml
+    tr = tmp_path / "tr"
+    tracks_tr = write_fake_aerialmind(str(tr), ("uav0000201_00000_v", "uav0000202_00000_v"), n=150, seed=20)
+    params = tmp_path / "belief.yaml"
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "rmot_fit_belief.py"), "--root", str(tr),
+                        "--split", "train", "--tracks-dir", tracks_tr, "--out", str(params)],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stderr[-2000:]
+    b = _yaml.safe_load(open(params))["rmot"]["belief"]
+    assert b["enabled"] and "pi_reason" in b and "rho_prior" in b
+    te = tmp_path / "te"
+    tracks_te = write_fake_aerialmind(str(te), ("uav0000009_03358_v",), n=150)
+    out = tmp_path / "run"
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "rmot_benchmark.py"), "--dataset", "aerialmind",
+                        "--root", str(te), "--split", "in_domain", "--vlm", "oracle", "--tracks-dir", tracks_te,
+                        "--methods", "search,ceiling", "--lags", "2,inf", "--no-zoom", "--belief-params", str(params),
+                        "--out", str(out)], capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stderr[-2000:]
+    import json as _json
+    st = [_json.loads(x) for x in open(out / "ceiling_Linf" / "stats.jsonl")]
+    assert all("belief" in s for s in st)
+    assert "WARNING" not in r.stdout

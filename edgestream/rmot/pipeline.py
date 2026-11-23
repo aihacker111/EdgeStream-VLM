@@ -17,10 +17,11 @@ same perception, prompts, VLM pool and lag semantics so that comparisons are com
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
+from .belief import BeliefConfig, BeliefModel, query_type
 from .expression import Query, parse
 from .hota import box_iou_xywh
 from .scheduler import AsyncVLM, Request, SchedulerConfig
@@ -74,6 +75,10 @@ class RMOTConfig:
     solver: SolverConfig = field(default_factory=SolverConfig)
     sched: SchedulerConfig = field(default_factory=SchedulerConfig)
     zoom_cfg: ZoomConfig = field(default_factory=ZoomConfig)
+    # probabilistic model of the method (edgestream/rmot/belief.py): when enabled it replaces the
+    # propagation / unverified-weight / coverage heuristics by marginals, a DetA-optimal threshold
+    # and value-of-information scheduling
+    belief: BeliefConfig = field(default_factory=BeliefConfig)
 
     def cal_logit(self, p: float, kind: str) -> float:
         z = logit(p, 0.02)
@@ -83,7 +88,8 @@ class RMOTConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "RMOTConfig":
         d = dict(d or {})
-        sub = {"graph": GraphConfig, "solver": SolverConfig, "sched": SchedulerConfig, "zoom_cfg": ZoomConfig}
+        sub = {"graph": GraphConfig, "solver": SolverConfig, "sched": SchedulerConfig, "zoom_cfg": ZoomConfig,
+               "belief": BeliefConfig}
         kw = {k: v for k, v in d.items() if k not in sub and k in cls.__dataclass_fields__}
         if "lag_s" in kw and kw["lag_s"] in ("inf", None):
             kw["lag_s"] = INF
@@ -182,7 +188,8 @@ class OnlineRMOT:
         c = self.cfg
         if not q.class_ok(s.cls_name):
             return c.class_mismatch
-        z = c.prior_base + c.kin_weight * g.kinematic_prior(s, q)
+        s.kin_score = g.kinematic_prior(s, q)
+        z = c.prior_base + c.kin_weight * s.kin_score
         if not q.measurable:
             z = min(z, c.unmeasured_cap)
         if self.clip is not None and c.clip_weight and s.n >= 3 and self._frames is not None:
@@ -209,6 +216,110 @@ class OnlineRMOT:
         t = s.obs[i].t if i < s.n else s.t1 + 1.0 / self.fps
         return t + self.cfg.lag_s
 
+    # ................................................................ belief model
+    def _verifier_model(self) -> tuple:
+        """(TPR, FPR, LLR of a stored answer logit) of the verifier in use."""
+        b = self.cfg.belief
+        acc = getattr(self.verifier, "acc", None)
+        if acc is not None and getattr(self.verifier, "truth_refer", None) is not None:   # GT oracle
+            acc = min(max(float(acc), 0.5 + 1e-6), 1 - 1e-6)
+            l = min(math.log(acc / (1 - acc)), b.llr_cap)
+            return acc, 1 - acc, (lambda z: l if z > 0 else -l)
+        base = logit(b.calib_base_rate)
+        return b.tpr, b.fpr, (lambda z: max(min(z - base, b.llr_cap), -b.llr_cap))
+
+    def _belief_model(self, g: TrackletGraph, now: float, q: Query) -> BeliefModel:
+        key = (round(now, 6), self._ans_ver, self._prior_ver)
+        if self._bm is not None and self._bm_key == key:
+            return self._bm
+        c, b = self.cfg, self.cfg.belief
+        if c.lag_s == INF:
+            nodes = list(self.compatible)
+        else:
+            lo = now - b.memory_s
+            nodes = [sid for sid in self.compatible if g.segs[sid].t1 >= lo]
+        _, _, conv = self._vmodel
+
+        def llr(sid):
+            s = g.segs[sid]
+            return sum(conv(z) / (1.0 + b.ans_corr * k) for k, z in enumerate(s.vlm_logits))
+        bm = BeliefModel(g, nodes, b, self._qtype, self._rho(), llr, lambda sid: g.segs[sid].kin_score)
+        # empirical Bayes: the base rate of this expression from the answered pieces
+        ans = [bm.mu[sid] for sid in nodes if g.segs[sid].vlm_logits]
+        self._rho_obs = (sum(ans), len(ans))
+        w = {sid: float(g.segs[sid].n) for sid in nodes}
+        self.theta_cur = bm.theta(w)
+        self.mu.update(bm.mu)
+        self._bm, self._bm_key = bm, key
+        return bm
+
+    def _belief_stats(self, g: TrackletGraph) -> dict:
+        comp = [sid for sid in self.compatible]
+        asked = [sid for sid in comp if g.segs[sid].vlm_logits]
+        pos = [sid for sid in comp if self.mu.get(sid, 0.0) > self.theta_cur]
+        return {"rho": round(self._rho(), 4), "theta": round(self.theta_cur, 4), "qtype": self._qtype,
+                "pieces": len(comp), "asked": len(asked), "positive": len(pos),
+                "positive_unasked": sum(1 for sid in pos if not g.segs[sid].vlm_logits),
+                **({"trees": len(self._bm.trees), "max_tree": max(len(v) for v in self._bm.trees.values()),
+                    "stitch_parents": sum(1 for j, i in self._bm.parent.items() if g.edges[(i, j)].kind == "stitch")}
+                   if self._bm is not None and self._bm.trees else {})}
+
+    def _rho(self) -> float:
+        a, b = self.cfg.belief.rho_prior.get(self._qtype, [1.0, 3.0])
+        sm, n = self._rho_obs
+        return (a + sm) / (a + b + n)
+
+    def _voi_requests(self, g: TrackletGraph, now: float, q: Query) -> list:
+        c, b = self.cfg, self.cfg.belief
+        bm = self._belief_model(g, now, q)
+        th = self.theta_cur
+        tpr, fpr, _ = self._vmodel
+        tau = now + self.vlm.expected_latency("refer")
+        tol = 0.5 * c.anchor_s + 1e-6
+        horizon = now - c.window_s
+        f = {sid: (self._uncommitted_frames(g.segs[sid], tau) if sid in self.live else 0.0) for sid in bm.nodes}
+        self._voi_f = f
+        pending = {sid: (1.0 / (1.0 + b.ans_corr * len(g.segs[sid].vlm_logits)), tpr, fpr)
+                   for sid in bm.nodes if g.segs[sid].n_asked_pending}
+        n_pend = {}
+        for sid in pending:
+            n_pend[bm.root_of[sid]] = n_pend.get(bm.root_of[sid], 0) + 1
+        # candidates: live pieces with a fresh anchor; trees with the most expected error first
+        cands: dict = {}
+        for sid in self.live:
+            s = g.segs[sid]
+            if sid not in bm.root_of or s.t1 < horizon:
+                continue
+            if not s.closed and s.duration(self.fps / c.stride) < c.min_ask_s:
+                continue
+            for at in sorted(self._anchors_of(s), reverse=True):
+                if at > now + 1e-9 or at < horizon:
+                    continue
+                key = ("refer", round(at, 3), sid)
+                if key in self.issued:
+                    continue
+                o = min(s.obs, key=lambda x: abs(x.t - at))
+                if abs(o.t - at) <= tol:
+                    cands.setdefault(bm.root_of[sid], []).append((sid, at, key))
+                    break
+        roots = sorted(cands, key=lambda r: -bm.tree_mass(r, f, th))
+        reqs, n_eval = [], 0
+        for r in roots:
+            if n_eval >= b.voi_topk:
+                break
+            if n_pend.get(r, 0) > b.max_pending_per_tree:
+                continue                                  # enough questions in flight on this object
+            for sid, at, key in cands[r]:
+                s = g.segs[sid]
+                w_i = 1.0 / (1.0 + b.ans_corr * (len(s.vlm_logits) + s.n_asked_pending))
+                v = bm.voi(sid, f, th, w_i, tpr, fpr, pending)
+                n_eval += 1
+                if v > c.sched.min_value:
+                    rq = Request("refer", key, [sid], self._anchor_rank(at), v)
+                    rq.tree = r
+                    reqs.append(rq)
+        return reqs
+
     # ................................................................ requests
     def _anchors_of(self, s: Segment) -> list:
         a = self.cfg.anchor_s
@@ -231,12 +342,13 @@ class OnlineRMOT:
 
     def _make_requests_inner(self, g: TrackletGraph, now: float, q: Query) -> list:
         c = self.cfg
+        self._trees_sent = set()
         tau = now + self.vlm.expected_latency("refer")
         tol = 0.5 * c.anchor_s + 1e-6
         # pools: (anchor_t, family) -> [segments with an observation near the anchor]
         pools: dict = {}
         horizon = now - c.window_s
-        for sid in self.live:
+        for sid in (() if c.belief.enabled else self.live):
             s = g.segs[sid]
             if s.t1 < horizon:
                 continue
@@ -282,6 +394,8 @@ class OnlineRMOT:
                     r_ = Request("refer", key, grp, self._anchor_rank(at), v * urg)
                     r_.cov0 = cov0                       # coverage when valued (see _dispatch)
                     reqs.append(r_)
+        if c.belief.enabled:
+            reqs = self._voi_requests(g, now, q)
         if c.link_verify:
             lo, hi = c.link_band
             for key, e in g.edges.items():
@@ -293,6 +407,16 @@ class OnlineRMOT:
                 if not (lo <= p <= hi):
                     continue
                 sj = g.segs[e.j]
+                if c.belief.enabled:
+                    # same units as the referring questions: frame errors the answer can remove,
+                    # i.e. the expected errors of the pieces that hang on this link in the model
+                    bm = self._bm
+                    if bm is None or bm.parent.get(e.j) != e.i:
+                        continue                          # not the link the model uses
+                    v = 4 * p * (1 - p) * bm.subtree_mass(e.j, self._voi_f, self.theta_cur)
+                    if v > c.sched.min_value:
+                        reqs.append(Request("link", ("link",) + key, [key], -1, v))
+                    continue
                 rel = max(sigmoid(g.effective_logit(e.i)), sigmoid(g.effective_logit(e.j)))
                 a = self._uncommitted_frames(sj, tau)
                 v = 4 * p * (1 - p) * rel * a
@@ -312,7 +436,13 @@ class OnlineRMOT:
             req = self.pool.pop(0)
             if req.key in self.issued:
                 continue
-            if (req.kind == "refer" and self.cfg.cover_weight and getattr(req, "cov0", 1.0) < 0.5
+            tree = getattr(req, "tree", None)
+            if tree is not None:
+                if tree in self._trees_sent:
+                    continue                              # re-valued with this one pending next round
+                self._trees_sent.add(tree)
+            if (req.kind == "refer" and not self.cfg.belief.enabled and self.cfg.cover_weight
+                    and getattr(req, "cov0", 1.0) < 0.5
                     and g.cfg.propagation != "hops"):
                 # valued when its object was uncovered; a piece of the same object may have been
                 # sent since (the pool is rebuilt every reopt_s): skip it, the next pool re-values it
@@ -340,6 +470,7 @@ class OnlineRMOT:
     def _apply(self, g: TrackletGraph, now: float) -> None:
         for t_avail, ans, req in self.vlm.collect(now):
             self.dirty = True
+            self._ans_ver += 1
             self.touched.update(req.members if req.kind == "refer" else [k for m in req.members for k in m])
             if req.kind == "refer":
                 for sid in req.members:
@@ -365,7 +496,13 @@ class OnlineRMOT:
                     if (sid in self.live and g.segs[sid].t1 >= horizon) or g.segs[sid].t1 >= ghost]
         if not free:
             return
-        if g.cfg.propagation == "hops":                   # legacy: own evidence only in the solver
+        if c.belief.enabled:                              # marginals of the belief model
+            bm = self._belief_model(g, now, self._q)
+            th = min(max(self.theta_cur, 1e-3), 1 - 1e-3)
+            self.solver.cfg.tau = math.log(th / (1 - th))
+            z = {sid: logit(bm.mu.get(sid, self._rho()), 1e-4) for sid in free}
+            y, x = self.solver.solve(g, free, z=z, only=only, support={sid: 1.0 for sid in free})
+        elif g.cfg.propagation == "hops":                 # legacy: own evidence only in the solver
             y, x = self.solver.solve(g, free, only=only)
         else:                                             # answers reach unasked pieces of the same object
             g.clear_memo()
@@ -384,6 +521,8 @@ class OnlineRMOT:
     def _label(self, g: TrackletGraph, s: Segment) -> int:
         if s.sid in self.y_sol:
             return self.y_sol[s.sid]
+        if self.cfg.belief.enabled:
+            return int(self.mu.get(s.sid, self._rho()) > self.theta_cur)
         # not solved yet (appeared since the last solve): chain-aware evidence, so a new piece
         # of an already-verified object keeps its label
         return int(g.effective_logit(s.sid) > self.cfg.solver.tau)
@@ -483,7 +622,15 @@ class OnlineRMOT:
         gcfg = GraphConfig(**{**c.graph.__dict__, "fps": fps / c.stride})
         g = TrackletGraph(gcfg, q)
         self.vlm = AsyncVLM(c.sched)
-        self.solver = WindowSolver(c.solver)
+        if c.belief.enabled:                              # own copy: tau / lam are set per stream
+            self.solver = WindowSolver(replace(c.solver, lam=c.belief.lam, unverified_w=1.0))
+        else:
+            self.solver = WindowSolver(c.solver)
+        self._q, self._qtype = q, query_type(q)
+        self._bm, self._bm_key, self._ans_ver, self._prior_ver = None, None, 0, 0
+        self._rho_obs, self.mu, self.theta_cur, self._trees_sent = (0.0, 0), {}, 0.5, set()
+        self._voi_f = {}
+        self._vmodel = self._verifier_model()
         self.y_sol, self.x_sol = {}, {}
         self.rows, self.pool, self.issued = [], [], set()
         self.live, self.live_all, self.compatible = set(), set(), set()
@@ -515,6 +662,7 @@ class OnlineRMOT:
                     s = g.segs[sid]
                     if not s.closed or s.prior_logit == 0.0:
                         s.prior_logit = self._prior(g, s, q)
+                self._prior_ver += 1
                 if use_vlm:
                     self.pool = self._make_requests(g, t, q)
                 if c.lag_s != INF:                   # offline: one exact solve at the end
@@ -568,7 +716,8 @@ class OnlineRMOT:
             "stitch_edges": sum(1 for e in g.edges.values() if e.kind == "stitch"),
             "solves": self.n_solves, "solver": self.solve_status,
             "zoom_calls": self.zoom.calls if self.zoom else 0, "zoom_hits": self.zoom.hits if self.zoom else 0,
-            "out_ids": self.next_id - 1}, "graph": g}
+            "out_ids": self.next_id - 1,
+            **({"belief": self._belief_stats(g)} if c.belief.enabled else {})}, "graph": g}
 
     # ................................................................ filter baselines
     def _run_filter(self, perception, expr, fps, image_wh, frames, affines) -> dict:

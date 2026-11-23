@@ -135,6 +135,26 @@ tracks + ReID embeddings + ego affine). VLM answers are cached by exact prompt c
 latency is replayed, so the logical clock is unchanged. `--tracks-dir` runs everything on an
 external tracker's MOT files instead (perception-matched comparison with other papers).
 
+### The probabilistic model (belief) and its fitted parameters
+
+The method's decisions come from one model (`edgestream/rmot/belief.py`): the pieces of one
+object hypothesis form a tree whose hidden "referred" states are linked by
+`P(r_j=1 | r_i) = rho + pi_e exp(-h dt) (r_i - rho)` (identity probability of the link x
+persistence of the state), with the measured motion and the VLM answers as noisy evidence. Exact
+sum-product gives the marginals; a piece is output when its marginal exceeds `J/(1+J)` (the
+expected-DetA-optimal threshold); questions are chosen by value of information (expected frame
+errors removed before the frames are committed), with questions in flight integrated out.
+Inference and VOI are checked against brute-force enumeration in `tests/test_belief.py`.
+
+All parameters are fitted on the TRAIN split (never on test):
+
+```bash
+python scripts/rmot_fit_belief.py --root data/AerialMind --split train \
+       --verifier-scores runs/lora_vl2b/val_scores_best.jsonl --out configs/belief_aerialmind.yaml
+python scripts/rmot_benchmark.py ... --belief-params configs/belief_aerialmind.yaml
+python scripts/rmot_benchmark.py ... --no-belief          # ablation: heuristic propagation + coverage
+```
+
 ### Verifier fine-tuning (LoRA, AerialMind train split only)
 
 Zero-shot verifiers top out around AUC 0.75 on AerialMind (`rmot_diagnose.py --mode probe`).

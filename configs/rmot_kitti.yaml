@@ -38,6 +38,14 @@ rmot:
     stitch_gap_s: 3.0
     stitch_gate: 2.5
     moving_bl_s: 0.35
+  belief:                       # the method's probabilistic model (edgestream/rmot/belief.py)
+    enabled: true               # false (or --no-belief) = heuristic propagation + coverage (ablation)
+    # every parameter below is FITTED on the train split by scripts/rmot_fit_belief.py and passed
+    # with --belief-params; the values here are only fallbacks
+    memory_s: 60.0
+    voi_topk: 160
+    max_pending_per_tree: 2
+    lam: 0.1
   solver:
     tau: 0.0
     lam: 1.0
