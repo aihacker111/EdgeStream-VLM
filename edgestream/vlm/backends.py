@@ -283,6 +283,17 @@ class OpenAICompatBackend(VLMBackend):
 
 
 # ---------------------------------------------------------------------- transformers
+def template_kwargs(processor) -> dict:
+    """``enable_thinking=False`` for chat templates that read it (Qwen3 / Qwen3.5 hybrids), nothing
+    otherwise: an unknown template kwarg makes transformers log a warning on every call."""
+    t = getattr(processor, "chat_template", None)
+    if isinstance(t, dict):
+        t = " ".join(str(v) for v in t.values())
+    if not t:
+        t = getattr(getattr(processor, "tokenizer", None), "chat_template", "") or ""
+    return {"enable_thinking": False} if "enable_thinking" in str(t) else {}
+
+
 class TransformersBackend(VLMBackend):
     """Local Hugging Face model, no server, e.g. ``Qwen/Qwen3-VL-2B-Instruct`` (+ a LoRA adapter).
 
@@ -319,6 +330,7 @@ class TransformersBackend(VLMBackend):
         if attn_implementation:
             kw["attn_implementation"] = attn_implementation
         self.processor = AutoProcessor.from_pretrained(model_id)
+        self._tkw = template_kwargs(self.processor)
         try:
             self.model = AutoModelForImageTextToText.from_pretrained(model_id, **kw)
         except TypeError:                                   # transformers < 4.56 calls it torch_dtype
@@ -355,11 +367,8 @@ class TransformersBackend(VLMBackend):
         return msgs, imgs
 
     def _render(self, msgs) -> str:
-        try:
-            return self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
-                                                      enable_thinking=False)
-        except TypeError:
-            return self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        return self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                  **self._tkw)
 
     def score_batch(self, reqs: list, top_logprobs: int = 10) -> list:
         """[(system, parts)] -> [ChatResult] with ONE generated token each, in one forward pass."""
@@ -468,13 +477,9 @@ class TransformersBackend(VLMBackend):
             return self._score(system, parts, top_logprobs)
         messages, _ = self._messages(system, parts)
         with self._lock:
-            try:
-                inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
-                                                            return_dict=True, return_tensors="pt",
-                                                            enable_thinking=False).to(self.device)
-            except TypeError:
-                inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
-                                                            return_dict=True, return_tensors="pt").to(self.device)
+            inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
+                                                        return_dict=True, return_tensors="pt",
+                                                        **self._tkw).to(self.device)
             t0 = time.perf_counter()
             with self.torch.inference_mode():
                 out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,

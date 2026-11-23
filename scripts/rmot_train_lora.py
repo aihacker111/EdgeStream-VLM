@@ -81,7 +81,8 @@ class Batcher:
     def _render(self, msgs, gen_prompt: bool) -> str:
         kw = dict(tokenize=False, add_generation_prompt=gen_prompt)
         try:
-            return self.proc.apply_chat_template(msgs, enable_thinking=False, **kw)
+            from edgestream.vlm.backends import template_kwargs
+            return self.proc.apply_chat_template(msgs, **template_kwargs(self.proc), **kw)
         except TypeError:
             return self.proc.apply_chat_template(msgs, **kw)
 
