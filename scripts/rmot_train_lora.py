@@ -155,7 +155,42 @@ def answer_loss(model, enc):
     return F.cross_entropy(logits[:, :-1, :].float().reshape(-1, logits.shape[-1]), tgt.reshape(-1), ignore_index=-100)
 
 
-def evaluate(model, batcher: Batcher, val: list, device, bs: int = 4, desc: str = "eval") -> dict:
+def breakdown(val: list, p) -> list:
+    """Where the verifier still fails: AUC of positives against each kind of negative, and per
+    facts on/off, expression type and object class (each subset keeps all its positives/negatives)."""
+    from edgestream.rmot.expression import parse
+    p = np.asarray(p, float)
+    y = np.array([int(r["label"]) for r in val])
+    pos = y == 1
+
+    def kind(r):
+        q = parse(r["expr"])
+        k = []
+        if q.has_kinematics():
+            k.append("motion")
+        if q.residual:
+            k.append("attribute/relation")
+        return "+".join(k) or "class only"
+
+    rows = []
+    hard = np.array([bool(r.get("hard_negative")) for r in val])
+    for name, m in (("pos vs hard neg (right class, other expr)", pos | hard), ("pos vs easy neg", pos | (~pos & ~hard))):
+        rows.append((name, int(m.sum()), auc(y[m], p[m]), float((p[m & ~pos] > 0.5).mean()) if (m & ~pos).any() else float("nan")))
+    for key, fn in (("facts", lambda r: "facts on" if r.get("facts") else "facts off"), ("expr", kind),
+                    ("class", lambda r: r.get("cls", "?"))):
+        groups = {}
+        for i, r in enumerate(val):
+            groups.setdefault(fn(r), []).append(i)
+        for g, idx in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            if len(idx) < 20:
+                continue
+            idx = np.array(idx)
+            neg = idx[y[idx] == 0]
+            rows.append((f"{key}: {g}", len(idx), auc(y[idx], p[idx]), float((p[neg] > 0.5).mean()) if len(neg) else float("nan")))
+    return rows
+
+
+def evaluate(model, batcher: Batcher, val: list, device, bs: int = 4, desc: str = "eval", return_scores: bool = False) -> dict:
     import torch
     import rmot_benchmark as RB
     model.eval()
@@ -182,8 +217,18 @@ def evaluate(model, batcher: Batcher, val: list, device, bs: int = 4, desc: str 
     yh = p > 0.5
     tp, fp, fn = (yh & (y == 1)).sum(), (yh & (y == 0)).sum(), (~yh & (y == 1)).sum()
     prec, rec = tp / max(tp + fp, 1), tp / max(tp + fn, 1)
-    return {"auc": auc(y, p), "acc": float((yh == y).mean()), "prec": float(prec), "rec": float(rec),
-            "f1": float(2 * prec * rec / max(prec + rec, 1e-9)), "yes_rate": float(yh.mean()), "n": len(y)}
+    # best accuracy over thresholds: what a calibrated threshold (Platt in the benchmark) can reach
+    best_acc, best_t = 0.0, 0.5
+    for t in np.unique(p):
+        a_t = float(((p >= t) == (y == 1)).mean())
+        if a_t > best_acc:
+            best_acc, best_t = a_t, float(t)
+    out = {"auc": auc(y, p), "acc": float((yh == y).mean()), "prec": float(prec), "rec": float(rec),
+           "f1": float(2 * prec * rec / max(prec + rec, 1e-9)), "yes_rate": float(yh.mean()), "n": len(y),
+           "best_acc": best_acc, "best_threshold": best_t}
+    if return_scores:
+        out["_scores"] = p.tolist()
+    return out
 
 
 def main():
@@ -254,8 +299,18 @@ def main():
     if a.adapter:
         model = PeftModel.from_pretrained(model, a.adapter, is_trainable=not a.eval_only)
     if a.eval_only:
-        r = evaluate(model, batcher, val, dev, bs=a.batch)
+        r = evaluate(model, batcher, val, dev, bs=a.batch, return_scores=True)
+        scores = r.pop("_scores")
         print(json.dumps({"eval_only": True, "model": a.model, "adapter": a.adapter, **r}, indent=1))
+        print(f"\n{'subset':45s} {'n':>5s} {'AUC':>6s} {'FP rate@0.5':>12s}")
+        for name, n, au, fpr in breakdown(val, scores):
+            print(f"{name:45s} {n:5d} {au:6.3f} {fpr:12.2f}")
+        tag = os.path.basename(os.path.normpath(a.adapter)) if a.adapter else "zero_shot"
+        with open(os.path.join(a.out, f"val_scores_{tag}.jsonl"), "w") as f:
+            for rec, sc in zip(val, scores):
+                f.write(json.dumps({"p": sc, "label": rec["label"], "expr": rec["expr"], "video": rec["video"],
+                                    "cls": rec.get("cls"), "facts": rec.get("facts"),
+                                    "hard_negative": rec.get("hard_negative")}) + "\n")
         return
     if not a.adapter:
         targets = r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
