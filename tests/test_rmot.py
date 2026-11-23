@@ -356,3 +356,40 @@ def test_v2_frame_cache_never_mixes_videos(tmp_path):
     fa = ver._frame_image(FrameSource(paths["a"]), 1)
     fb = ver._frame_image(FrameSource(paths["b"]), 1)
     assert fa.mean() < 50 and fb.mean() > 200
+
+
+def test_identity_propagation_covers_the_track_until_a_suspicious_cut():
+    """One answer reaches every piece of the same object across length cuts (artificial), but not
+    across a cut where the identity is doubtful; the legacy 'hops' mode stops after 3 pieces."""
+    from perception.types import TrackOutput
+    from edgestream.rmot.tracklets import logit as _logit
+
+    def build(prop):
+        g = TrackletGraph(GraphConfig(fps=10.0, max_len_s=1.0, propagation=prop))
+        for r in range(120):                               # one car, 12 s, steady motion -> ~12 pieces
+            box = np.array([10 + 2 * r, 50, 20, 12], np.float32)
+            g.update(r, r / 10.0, [TrackOutput(1, 1, 3, "car", box, np.zeros(2, np.float32), 0.9, 0.9, r, False)],
+                     (640, 360), None)
+        for s in g.segs.values():
+            s.prior_logit = -1.0
+        return g
+
+    g = build("identity")
+    order = sorted(g.segs, key=lambda k: g.segs[k].t0)
+    assert len(order) >= 10 and all(g.segs[k].cut_reason == "length" for k in order[1:])
+    g.segs[order[0]].vlm_logits.append(4.0)                # "yes" on the first second only
+    last = order[-1]
+    z0 = g.seg_logit(g.segs[order[0]])                     # the answered piece (prior-shrunk)
+    assert g.effective_logit(last) > 0.9 * z0 > 0 and g.support(last) > 0.9
+    # an identity switch in the middle: the answer must not cross it
+    mid = order[len(order) // 2]
+    key = next(k for k in g.in_edges[mid])
+    g.segs[mid].cut_reason = "jump"
+    g.edges[key].prior_logit = _logit(0.3)
+    assert g.support(last) == 0.0 and g.effective_logit(last) == -1.0
+    assert g.support(order[len(order) // 2 - 1]) > 0.9
+    # legacy: the answer fades after a few pieces
+    h = build("hops")
+    order_h = sorted(h.segs, key=lambda k: h.segs[k].t0)
+    h.segs[order_h[0]].vlm_logits.append(4.0)
+    assert h.effective_logit(order_h[-1]) < 0.0

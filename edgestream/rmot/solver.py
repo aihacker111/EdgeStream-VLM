@@ -33,6 +33,7 @@ class SolverConfig:
     scale: int = 100
     future_s: float = 1.0           # an open piece is expected to last this much longer
     unverified_w: float = 0.3       # weight of the prior of a piece the VLM has not answered yet
+                                    # (raised towards 1 by the support of answers about the same object)
 
 
 def _fully_committed(s) -> bool:
@@ -56,21 +57,23 @@ class WindowSolver:
         self.last_status = ""
         self.hint_y: dict = {}
 
-    def _gains(self, g: TrackletGraph, nodes: list, z: dict) -> dict:
+    def _gains(self, g: TrackletGraph, nodes: list, z: dict, support: dict | None = None) -> dict:
         c = self.cfg
         out = {}
         for sid in nodes:
             s = g.segs[sid]
             # evidence is about the whole piece, committed or not ("frozen outputs, live beliefs")
             answered = bool(s.vlm_logits)
-            w = s.n / g.cfg.fps + (c.future_s if (answered and not s.closed) else 0.0)
+            sup = 1.0 if answered else (support or {}).get(sid, 0.0)
+            w = s.n / g.cfg.fps + (c.future_s if (sup > 0.5 and not s.closed) else 0.0)
             if not answered:
-                w *= c.unverified_w
+                w *= c.unverified_w + (1.0 - c.unverified_w) * sup
             zz = max(min(z[sid], c.clip), -c.clip)
             out[sid] = w * (zz - c.tau)
         return out
 
-    def solve(self, g: TrackletGraph, free: list, z: dict | None = None, only: set | None = None) -> tuple[dict, dict]:
+    def solve(self, g: TrackletGraph, free: list, z: dict | None = None, only: set | None = None,
+              support: dict | None = None) -> tuple[dict, dict]:
         """``free`` = segment ids whose label is still open. Returns (y, x) for the free nodes and
         every edge touching them. ``only``: re-solve just the components containing these nodes."""
         c = self.cfg
@@ -84,7 +87,7 @@ class WindowSolver:
                 if e.fixed is None and g.edge_logit(e) < c.min_link_logit:
                     continue
                 edges[key] = e
-        gains = self._gains(g, free, z)
+        gains = self._gains(g, free, z, support)
         if self.backend != "cpsat" or not free:
             return self._greedy(g, free_set, edges, gains)
         # independent connected components (through candidate edges) are solved separately

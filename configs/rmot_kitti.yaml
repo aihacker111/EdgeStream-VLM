@@ -29,6 +29,8 @@ rmot:
   filter_prompt: single
   filter_facts: false
   graph:
+    propagation: identity       # identity: an answer covers the object until a suspicious cut | hops: legacy ablation
+    p_prop_length: 0.995        # P(same object) across a cut made only for length
     max_len_s: 1.0
     min_len_s: 0.2
     end_after_s: 0.5

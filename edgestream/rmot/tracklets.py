@@ -45,6 +45,17 @@ class GraphConfig:
     kin_window_s: float = 2.0       # track history used for kinematic features
     moving_bl_s: float = 0.35       # body lengths per second above which an object is "moving"
     ego_min_px_s: float = 8.0       # drone apparent speed below which "relative to us" is undefined
+    # how a VLM answer reaches the pieces nobody asked about:
+    #   identity: along links, weighted by P(same object) of every link on the way; a cut made only
+    #             because a piece reached max_len_s is artificial (p_prop_length), a suspicious cut
+    #             (jump, appearance, class, recovered, resume, stitch) passes its own link belief.
+    #             The answer of one piece then covers the whole stretch of track between two
+    #             suspicious cuts, as a filter baseline does, while an identity switch still stops it.
+    #   hops:     legacy, the answer decays 0.5 per piece over at most 3 pieces (ablation).
+    propagation: str = "identity"
+    p_prop_length: float = 0.995
+    prop_max_hops: int = 90
+    prop_min_w: float = 0.05
 
 
 @dataclass
@@ -464,13 +475,74 @@ class TrackletGraph:
         self._memo = {}
 
     def effective_logit(self, sid: int, gamma: float = 0.5) -> float:
+        """Belief that piece ``sid`` is referred, using the answers about the same object."""
+        return self._cached_belief(sid, gamma)[0]
+
+    def support(self, sid: int) -> float:
+        """How much of the belief of an unasked piece comes from answers about the same object
+        (0 = prior only, 1 = as good as asked). 1.0 for an answered piece."""
+        return self._cached_belief(sid)[1]
+
+    def _cached_belief(self, sid: int, gamma: float = 0.5) -> tuple:
         memo = getattr(self, "_memo", None)
         if memo is not None and sid in memo:
             return memo[sid]
-        v = self._effective_logit(sid, gamma)
+        if self.cfg.propagation == "hops":
+            v = (self._effective_logit(sid, gamma), 1.0 if self.segs[sid].vlm_logits else 0.0)
+        else:
+            v = self._identity_belief(sid)
         if memo is not None:
             memo[sid] = v
         return v
+
+    def prop_weight(self, e: Edge) -> float:
+        """P(the two pieces of ``e`` are the same object), as used for propagating answers."""
+        if e.fixed == 0:
+            return 0.0
+        if e.kind == "cont" and not e.vlm_logits and self.segs[e.j].cut_reason == "length":
+            return self.cfg.p_prop_length
+        return sigmoid(self.edge_logit(e))
+
+    def _identity_belief(self, sid: int) -> tuple:
+        s = self.segs[sid]
+        if s.vlm_logits:
+            return max(min(self.seg_logit(s), 12.0), -12.0), 1.0
+        # best-path P(same object) to the nearest answered pieces, both directions; the search
+        # stops at an answered piece (it already summarises what lies beyond it)
+        best = {sid: 1.0}
+        frontier = [sid]
+        found = {}
+        for _ in range(self.cfg.prop_max_hops):
+            nxt = []
+            for u in frontier:
+                wu = best[u]
+                for key in self.out_edges.get(u, []) + self.in_edges.get(u, []):
+                    e = self.edges[key]
+                    pe = self.prop_weight(e)
+                    if pe <= 0.5:
+                        continue
+                    v = e.j if e.i == u else e.i
+                    w = wu * pe
+                    if w < self.cfg.prop_min_w or w <= best.get(v, 0.0):
+                        continue
+                    best[v] = w
+                    if self.segs[v].vlm_logits:
+                        found[v] = w
+                    else:
+                        nxt.append(v)
+            if not nxt:
+                break
+            frontier = nxt
+        if not found:
+            return max(min(s.prior_logit, 12.0), -12.0), 0.0
+        tot = sum(found.values())
+        z_ev = sum(w * self.seg_logit(self.segs[k]) for k, w in found.items()) / tot
+        miss = 1.0
+        for w in found.values():
+            miss *= 1.0 - w
+        sup = 1.0 - miss                                  # P(at least one answer is about this object)
+        z = sup * z_ev + (1.0 - sup) * s.prior_logit
+        return max(min(z, 12.0), -12.0), sup
 
     def _effective_logit(self, sid: int, gamma: float = 0.5) -> float:
         s = self.segs[sid]

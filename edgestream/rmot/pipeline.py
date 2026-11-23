@@ -343,7 +343,16 @@ class OnlineRMOT:
                     if (sid in self.live and g.segs[sid].t1 >= horizon) or g.segs[sid].t1 >= ghost]
         if not free:
             return
-        y, x = self.solver.solve(g, free, only=only)
+        if g.cfg.propagation == "hops":                   # legacy: own evidence only in the solver
+            y, x = self.solver.solve(g, free, only=only)
+        else:                                             # answers reach unasked pieces of the same object
+            g.clear_memo()
+            try:
+                z = {sid: g.effective_logit(sid) for sid in free}
+                sup = {sid: g.support(sid) for sid in free}
+            finally:
+                g._memo = None
+            y, x = self.solver.solve(g, free, z=z, only=only, support=sup)
         self.touched = set()
         self.y_sol.update(y)
         self.x_sol.update(x)
