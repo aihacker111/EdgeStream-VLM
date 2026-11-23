@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import re
 import os
 import sys
 import time
@@ -95,12 +96,32 @@ def build_vlm(cfg: dict, args):
         t = dict(v.get("transformers") or {})
         if args.vlm_model:
             t["model_id"] = args.vlm_model
+        if getattr(args, "vlm_adapter", None):
+            t["adapter"] = args.vlm_adapter
+        if getattr(args, "vlm_batch", None):
+            t["max_batch"] = args.vlm_batch
         be = TransformersBackend(**t)
     else:
         raise SystemExit(f"unknown --vlm {kind}")
     return kind, VLMVerifier(be, overview_width=v.get("overview_width", 1280), facts=v.get("facts", True),
                              prompt=v.get("prompt", "v2"), frame_width=v.get("frame_width", 1024),
                              crop_h=v.get("crop_h", 160))
+
+
+def vlm_tag(cfg: dict, args) -> str:
+    """Names the answer cache after the backend AND the model (+ adapter): answers of a zero-shot
+    model are never served to a fine-tuned one that shares the output folder."""
+    kind = args.vlm or cfg["vlm"].get("backend", "openai")
+    v = cfg["vlm"]
+    if kind == "openai":
+        model = args.vlm_model or (v.get("openai") or {}).get("model", "")
+    elif kind == "transformers":
+        model = args.vlm_model or (v.get("transformers") or {}).get("model_id", "")
+    else:
+        return kind
+    ad = getattr(args, "vlm_adapter", None)
+    tag = os.path.basename(os.path.normpath(model)) + (("+" + "_".join(os.path.normpath(ad).split(os.sep)[-2:])) if ad else "")
+    return kind + "_" + re.sub(r"[^A-Za-z0-9._+-]+", "-", tag).strip("-")
 
 
 _W: dict = {}
@@ -163,7 +184,7 @@ def _init_worker(state: dict, split) -> None:
     _W.update(state)
     _W["split"] = split
     kind, ver = build_vlm(state["cfg"], a) if state["vlm_kind"] != "oracle" else ("oracle", None)
-    path = os.path.join(a.out, f"vlm_cache_{kind}.jsonl")
+    path = os.path.join(a.out, f"vlm_cache_{vlm_tag(state['cfg'], a)}.jsonl")
     _W["cached"] = CachedVerifier(ver, path) if ver is not None else None
     _W["zoom"] = None
     if not a.no_zoom and state["base"].get("zoom", True) and not a.tracks_dir:
@@ -286,7 +307,9 @@ def main():
     ap.add_argument("--lags", default="0,2,5,inf")
     ap.add_argument("--vlm", default=None, choices=["openai", "transformers", "oracle"])
     ap.add_argument("--vlm-url", default=None)
-    ap.add_argument("--vlm-model", default=None)
+    ap.add_argument("--vlm-model", default=None, help="served model name (openai) or HF id / local folder (transformers)")
+    ap.add_argument("--vlm-adapter", default=None, help="transformers: LoRA folder from rmot_train_lora.py (e.g. runs/lora_vl2b/best)")
+    ap.add_argument("--vlm-batch", type=int, default=None, help="transformers: max requests per forward pass (default 8)")
     ap.add_argument("--n-workers", type=int, default=None)
     ap.add_argument("--latency-scale", type=float, default=None)
     ap.add_argument("--fixed-latency", type=float, default=None)
@@ -339,6 +362,11 @@ def main():
           f"methods {methods}; lags {[lag_name(L) for L in lags]}")
 
     vlm_kind = a.vlm or cfg["vlm"].get("backend", "openai")
+    if vlm_kind == "transformers" and a.jobs > 1:
+        # every worker process would load its own copy of the model on the GPU; one process already
+        # runs the verifier pool's concurrent requests as batched forward passes
+        print(f"--vlm transformers: --jobs {a.jobs} -> 1 (the model is loaded once, requests are batched)", flush=True)
+        a.jobs = 1
     cache_root = a.perception_cache or os.path.join(os.path.dirname(os.path.abspath(a.out)), "perception_cache", a.dataset)
     # ---- phase 1: perception once per video (GPU, sequential)
     if not a.tracks_dir:

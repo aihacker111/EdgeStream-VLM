@@ -103,3 +103,67 @@ def test_sft_data_and_lora_training_end_to_end(tmp_path):
     r = run("scripts/rmot_train_lora.py", "--data", sft, "--model", tmp_path / "m", "--out", out, "--adapter", ad,
             "--merge-to", out / "merged", "--device", "cpu")
     assert r.returncode == 0 and (out / "merged" / "config.json").is_file(), r.stderr[-2000:]
+
+
+def test_local_backend_batches_one_token_requests(tmp_path):
+    """No server: concurrent one-token requests are grouped into one forward pass, and a batch gives
+    exactly the P(yes) of scoring each request alone (left padding, mRoPE positions)."""
+    import threading
+    from edgestream.vlm.backends import TransformersBackend, first_token_yes_probability
+    try:
+        _tiny_qwen3_vl(tmp_path / "m")
+    except Exception as e:
+        pytest.skip(f"cannot build a tiny Qwen3-VL with transformers {transformers.__version__}: {e}")
+    be = TransformersBackend(str(tmp_path / "m"), device="cpu", max_batch=4, batch_wait_ms=50)
+    rng = np.random.default_rng(0)
+    reqs = [("sys", [("text", "Frame:"), ("image", rng.integers(0, 255, (40 + 16 * i, 64 + 8 * i, 3), dtype=np.uint8)),
+                     ("text", "yes no " * (i + 1) + "Answer yes or no.")]) for i in range(6)]
+    alone = [first_token_yes_probability(be.score_batch([r])[0].tokens) for r in reqs]
+    together = [first_token_yes_probability(c.tokens) for c in be.score_batch(reqs)]
+    assert max(abs(x - y) for x, y in zip(alone, together)) < 1e-4
+    out = [None] * len(reqs)
+
+    def ask(i):
+        out[i] = be.chat(reqs[i][0], reqs[i][1], max_new_tokens=1, schema=None, top_logprobs=3)
+    ts = [threading.Thread(target=ask, args=(i,)) for i in range(len(reqs))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert max(abs(x - first_token_yes_probability(c.tokens)) for x, c in zip(alone, out)) < 1e-4
+    assert len({c.latency_s for c in out}) < len(reqs)          # some requests shared a forward pass
+    for c in out:                                               # yes AND no always present for P(yes)
+        words = {k.strip().lower() for k in c.tokens[0][1]}
+        assert "yes" in words and "no" in words
+
+
+def test_benchmark_runs_the_model_in_process(tmp_path):
+    """rmot_benchmark.py --vlm transformers (+ a LoRA adapter): no vLLM server, --jobs forced to 1,
+    answer cache named after model and adapter."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    peft = pytest.importorskip("peft")
+    root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(Path(__file__).parent))
+    from synthetic_rmot import write_fake_aerialmind
+    try:
+        _tiny_qwen3_vl(tmp_path / "m")
+    except Exception as e:
+        pytest.skip(f"cannot build a tiny Qwen3-VL with transformers {transformers.__version__}: {e}")
+    from transformers import AutoModelForImageTextToText
+    m = AutoModelForImageTextToText.from_pretrained(str(tmp_path / "m"))
+    lora = peft.get_peft_model(m, peft.LoraConfig(r=4, target_modules=r".*language_model.*\.(q_proj|v_proj)"))
+    lora.save_pretrained(str(tmp_path / "ad"))
+    am = tmp_path / "am"
+    tracks = write_fake_aerialmind(str(am), ("uav0000009_03358_v",), n=30)
+    out = tmp_path / "run"
+    r = subprocess.run([sys.executable, "scripts/rmot_benchmark.py", "--dataset", "aerialmind", "--root", str(am),
+                        "--split", "in_domain", "--vlm", "transformers", "--vlm-model", str(tmp_path / "m"),
+                        "--vlm-adapter", str(tmp_path / "ad"), "--tracks-dir", tracks, "--methods", "search",
+                        "--lags", "2", "--jobs", "3", "--no-zoom", "--out", str(out)],
+                       cwd=root, capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "-> 1" in r.stdout
+    assert (out / "summary.md").is_file()
+    assert list(out.glob("vlm_cache_transformers_m+*ad.jsonl"))

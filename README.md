@@ -151,6 +151,22 @@ vllm serve runs/lora_vl2b/merged --served-model-name rmot --enable-prefix-cachin
 python scripts/rmot_diagnose.py --mode probe ... --vlm-model rmot   # compare with the zero-shot probe
 ```
 
+**Without a server.** `--vlm transformers` loads the model inside the benchmark process (base +
+`--vlm-adapter`, merged at load, or a merged folder as `--vlm-model`). Prompt v2 needs one token,
+so each request is a single forward pass; concurrent requests of the verifier pool are grouped
+into one padded batch (`--vlm-batch`, default 8), and a batch gives the same P(yes) as scoring
+each request alone. `--jobs` is forced to 1 (one model in memory).
+
+```bash
+python scripts/rmot_benchmark.py --dataset aerialmind --root data/AerialMind --split in_domain \
+     --seqmap data/AerialMind/seqmap.txt --methods search,filter_kf --lags 0,2,5,inf \
+     --vlm transformers --vlm-model Qwen/Qwen3-VL-2B-Instruct --vlm-adapter runs/lora_vl2b/best \
+     --n-workers 4 --match-compute --out runs/rmot_am_id_lora
+```
+
+The answer cache is named after backend, model and adapter (`vlm_cache_<backend>_<model>+<adapter>.jsonl`),
+so zero-shot and fine-tuned answers never mix in one output folder.
+
 Candidates are the tracker's own pieces (test-time distribution), labelled from GT (referred
 fraction ≥ 0.6 → yes, ≤ 0.1 → no); half the negatives are hard (right class, referred by another
 expression). Validation is on held-out train videos; the best adapter by AUC is kept.

@@ -284,16 +284,26 @@ class OpenAICompatBackend(VLMBackend):
 
 # ---------------------------------------------------------------------- transformers
 class TransformersBackend(VLMBackend):
-    """Local Hugging Face model (no server), e.g. ``Qwen/Qwen3-VL-2B-Instruct``.
+    """Local Hugging Face model, no server, e.g. ``Qwen/Qwen3-VL-2B-Instruct`` (+ a LoRA adapter).
 
     Runs on CUDA, Apple-silicon MPS or CPU (``device: auto`` picks in that order). Needs
-    transformers >= 4.57 (Qwen3-VL). JSON is enforced by parsing; P(yes) comes from the scores
-    at the verdict token, like the logprobs of the server backend.
+    transformers >= 4.57 (Qwen3-VL).
+
+    One-token yes/no requests (prompt v2: ``max_new_tokens=1``, no schema) never call generate():
+    they are ONE forward pass reading the logits of the first answer token, and requests made at
+    the same time from several threads (the verifier pool) are grouped into one padded batch by a
+    single model thread, so the GPU sees batches like a vLLM server would. Every request of a batch
+    reports the batch's wall time as its latency (they ran concurrently). Longer generations
+    (JSON prompts) take the generate() path, one at a time.
+
+    ``adapter``: a PEFT/LoRA folder from scripts/rmot_train_lora.py; merged into the weights at load.
     """
     name = "transformers"
 
     def __init__(self, model_id: str, device: str = "auto", dtype: str = "auto",
-                 attn_implementation: str | None = None):
+                 attn_implementation: str | None = None, adapter: str | None = None,
+                 max_batch: int = 8, batch_wait_ms: float = 4.0):
+        import threading
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
         self.torch = torch
@@ -314,8 +324,118 @@ class TransformersBackend(VLMBackend):
         except TypeError:                                   # transformers < 4.56 calls it torch_dtype
             kw["torch_dtype"] = kw.pop("dtype")
             self.model = AutoModelForImageTextToText.from_pretrained(model_id, **kw)
+        if adapter:
+            from peft import PeftModel                      # merged: no LoRA overhead per forward
+            self.model = PeftModel.from_pretrained(self.model, adapter).merge_and_unload()
         self.model.to(self.device).eval()
         self.model_id = model_id
+        self.adapter = adapter
+        self.max_batch = max(1, int(max_batch))
+        self.batch_wait_s = max(0.0, float(batch_wait_ms)) / 1000.0
+        tok = self.processor.tokenizer
+        self._answer_ids = {}                               # always reported, even outside the top-k
+        for w in ("yes", "Yes", " yes", " Yes", "YES", "no", "No", " no", " No", "NO"):
+            ids = tok.encode(w, add_special_tokens=False)
+            if ids:
+                self._answer_ids.setdefault(ids[0], tok.decode([ids[0]]))
+        self._lock = threading.Lock()                       # generate() path and the model thread
+        self._cv = threading.Condition()
+        self._queue: list = []
+        self._thread = None
+
+    # ------------------------------------------------------------ one-token scoring (batched)
+    def _messages(self, system: str, parts: list):
+        from PIL import Image
+        content = [{"type": "text", "text": v} if k == "text" else
+                   {"type": "image", "image": Image.fromarray(cv2.cvtColor(v, cv2.COLOR_BGR2RGB))}
+                   for k, v in parts]
+        msgs = [{"role": "system", "content": [{"type": "text", "text": system}]},
+                {"role": "user", "content": content}]
+        imgs = [c["image"] for c in content if c["type"] == "image"]
+        return msgs, imgs
+
+    def _render(self, msgs) -> str:
+        try:
+            return self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                      enable_thinking=False)
+        except TypeError:
+            return self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+    def score_batch(self, reqs: list, top_logprobs: int = 10) -> list:
+        """[(system, parts)] -> [ChatResult] with ONE generated token each, in one forward pass."""
+        torch = self.torch
+        texts, images = [], []
+        for system, parts in reqs:
+            msgs, imgs = self._messages(system, parts)
+            texts.append(self._render(msgs))
+            images.extend(imgs)
+        tok = self.processor.tokenizer
+        with self._lock:
+            old = tok.padding_side
+            tok.padding_side = "left"                      # last position = first answer token, every row
+            try:
+                enc = self.processor(text=texts, images=images or None, return_tensors="pt", padding=True)
+            finally:
+                tok.padding_side = old
+            enc = enc.to(self.device)
+            t0 = time.perf_counter()
+            with torch.inference_mode():
+                try:
+                    logits = self.model(**enc, logits_to_keep=1).logits[:, -1, :]
+                except TypeError:
+                    logits = self.model(**enc).logits[:, -1, :]
+                lp = torch.log_softmax(logits.float(), dim=-1)
+                k = max(1, min(int(top_logprobs), lp.shape[-1]))
+                v, ix = lp.topk(k, dim=-1)
+                ans_ids = list(self._answer_ids)
+                ans_lp = lp[:, ans_ids].tolist() if ans_ids else [[] for _ in reqs]
+                v, ix = v.tolist(), ix.tolist()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            elif self.device.type == "mps":
+                torch.mps.synchronize()
+            dt = time.perf_counter() - t0
+        n_in = enc["attention_mask"].sum(-1).tolist()
+        out = []
+        for r in range(len(reqs)):
+            alts = {tok.decode([int(j)]): float(x) for x, j in zip(v[r], ix[r])}
+            for j, x in zip(ans_ids, ans_lp[r]):
+                alts.setdefault(self._answer_ids[j], float(x))
+            first = tok.decode([int(ix[r][0])])
+            out.append(ChatResult(first, [(first, alts)], int(n_in[r]), 1, dt))
+        return out
+
+    def _worker(self) -> None:
+        while True:
+            with self._cv:
+                while not self._queue:
+                    self._cv.wait()
+                if self.batch_wait_s and len(self._queue) < self.max_batch:
+                    self._cv.wait(timeout=self.batch_wait_s)   # let concurrent requests join the batch
+                batch, self._queue = self._queue[: self.max_batch], self._queue[self.max_batch:]
+            try:
+                res = self.score_batch([(sys_, parts) for sys_, parts, _, _ in batch], max(t for _, _, t, _ in batch))
+                for (_, _, _, slot), r in zip(batch, res):
+                    slot["result"] = r
+            except Exception as e:                         # every waiter gets the error
+                for *_, slot in batch:
+                    slot["error"] = e
+            for *_, slot in batch:
+                slot["done"].set()
+
+    def _score(self, system: str, parts: list, top_logprobs: int) -> ChatResult:
+        import threading
+        slot = {"done": threading.Event()}
+        with self._cv:
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._worker, name="vlm-batcher", daemon=True)
+                self._thread.start()
+            self._queue.append((system, parts, top_logprobs, slot))
+            self._cv.notify_all()
+        slot["done"].wait()
+        if "error" in slot:
+            raise slot["error"]
+        return slot["result"]
 
     def generate(self, req: VLMRequest) -> RawResult:
         from PIL import Image
@@ -344,22 +464,24 @@ class TransformersBackend(VLMBackend):
 
     def chat(self, system: str, parts: list, max_new_tokens: int = 128, schema: dict | None = None,
              top_logprobs: int = 5) -> ChatResult:
-        from PIL import Image
-        content = [{"type": "text", "text": v} if k == "text" else
-                   {"type": "image", "image": Image.fromarray(cv2.cvtColor(v, cv2.COLOR_BGR2RGB))}
-                   for k, v in parts]
-        messages = [{"role": "system", "content": [{"type": "text", "text": system}]},
-                    {"role": "user", "content": content}]
-        inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
-                                                    return_dict=True, return_tensors="pt",
-                                                    enable_thinking=False).to(self.device)
-        t0 = time.perf_counter()
-        with self.torch.inference_mode():
-            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
-                                      output_scores=True, return_dict_in_generate=True)
-        if self.device.type == "mps":
-            self.torch.mps.synchronize()
-        dt = time.perf_counter() - t0
+        if max_new_tokens == 1 and schema is None:          # prompt v2: batched forward pass, no generate
+            return self._score(system, parts, top_logprobs)
+        messages, _ = self._messages(system, parts)
+        with self._lock:
+            try:
+                inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
+                                                            return_dict=True, return_tensors="pt",
+                                                            enable_thinking=False).to(self.device)
+            except TypeError:
+                inputs = self.processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
+                                                            return_dict=True, return_tensors="pt").to(self.device)
+            t0 = time.perf_counter()
+            with self.torch.inference_mode():
+                out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                                          output_scores=True, return_dict_in_generate=True)
+            if self.device.type == "mps":
+                self.torch.mps.synchronize()
+            dt = time.perf_counter() - t0
         n_in = inputs["input_ids"].shape[1]
         gen = out.sequences[0, n_in:].tolist()
         tok = self.processor.tokenizer

@@ -259,7 +259,10 @@ class VLMVerifier:
         import threading
         self._fc_lock = threading.Lock()
         # concurrent calls only make sense for a server (vLLM batches them); a local model is sequential
-        self.parallel = getattr(backend, "name", "") in ("openai", "vllm", "ollama") or hasattr(backend, "_post")
+        # concurrent calls pay off for a server (it batches them) and for the local backend, whose
+        # model thread groups concurrent one-token requests into one forward pass
+        self.parallel = (getattr(backend, "name", "") in ("openai", "vllm", "ollama", "transformers")
+                         or hasattr(backend, "_post"))
         self.overview_width = overview_width
         self.facts = facts
         self.max_new_tokens = max_new_tokens

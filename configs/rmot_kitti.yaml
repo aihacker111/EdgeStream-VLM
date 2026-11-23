@@ -65,10 +65,12 @@ vlm:
     model: Qwen/Qwen3-VL-4B-Instruct-FP8   # or Qwen/Qwen3.5-4B, Qwen/Qwen3-VL-2B-Instruct (must match `vllm serve`)
     chat_template_kwargs: {enable_thinking: false}   # Qwen3.5: no reasoning tokens
     timeout_s: 120
-  transformers:
-    model_id: Qwen/Qwen3-VL-4B-Instruct      # FP8 checkpoints load in vLLM/SGLang, not in transformers
+  transformers:                 # no server: python loads the model (--vlm transformers)
+    model_id: Qwen/Qwen3-VL-2B-Instruct      # BF16 base of the LoRA; FP8 checkpoints need vLLM/SGLang
+    adapter: null                 # or --vlm-adapter runs/lora_vl2b/best (or a merged folder as model_id)
     device: auto
     dtype: auto
+    max_batch: 8                  # concurrent one-token requests per forward pass
   oracle:                       # NOT a VLM: GT answers with errors (plumbing / ceiling only)
     acc: 0.9
     conf: 0.85

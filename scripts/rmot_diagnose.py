@@ -245,6 +245,8 @@ def main():
     ap.add_argument("--vlm", default="openai", choices=["openai", "transformers"])
     ap.add_argument("--vlm-url", default=None)
     ap.add_argument("--vlm-model", default=None)
+    ap.add_argument("--vlm-adapter", default=None, help="transformers: LoRA folder (runs/lora_vl2b/best)")
+    ap.add_argument("--vlm-batch", type=int, default=None, help="transformers: max requests per forward pass")
     ap.add_argument("--n-workers", type=int, default=4)
     ap.add_argument("--max-videos", type=int, default=2)
     ap.add_argument("--max-expr", type=int, default=5)
@@ -285,9 +287,10 @@ def main():
                 run_perception(split.videos[v].frames, perceptor, cache_root, v, fps, pbar=pp)
             pp.close()
             del perceptor
-    args = argparse.Namespace(vlm=a.vlm, vlm_url=a.vlm_url, vlm_model=a.vlm_model)
+    args = argparse.Namespace(vlm=a.vlm, vlm_url=a.vlm_url, vlm_model=a.vlm_model,
+                              vlm_adapter=a.vlm_adapter, vlm_batch=a.vlm_batch)
     kind, ver = RB.build_vlm(cfg, args)
-    cached = CachedVerifier(ver, os.path.join(a.out, f"vlm_cache_{kind}.jsonl"))
+    cached = CachedVerifier(ver, os.path.join(a.out, f"vlm_cache_{RB.vlm_tag(cfg, args)}.jsonl"))
     if a.mode == "probe":
         return probe(a, split, vids, cache_root, fps, cached, ver)
     rows = []
