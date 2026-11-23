@@ -97,15 +97,20 @@ class Batcher:
             texts.append(full)
             answers.append(full[len(prompt):])
             images.extend(imgs)
-        enc = self.proc(text=texts, images=images or None, return_tensors="pt", padding=True)
-        labels = torch.full_like(enc["input_ids"], -100)
         tok = self.proc.tokenizer
+        old = tok.padding_side
+        tok.padding_side = "left"          # answers end every row -> only the last few logits are needed
+        try:
+            enc = self.proc(text=texts, images=images or None, return_tensors="pt", padding=True)
+        finally:
+            tok.padding_side = old
+        labels = torch.full_like(enc["input_ids"], -100)
         for i, ans in enumerate(answers):
             ids = tok.encode(ans, add_special_tokens=False)
             row = enc["input_ids"][i]
             mask = enc["attention_mask"][i].bool()
             pos = torch.nonzero(mask).flatten()
-            end = int(pos[-1]) + 1 if tok.padding_side != "left" else len(row)
+            end = int(pos[-1]) + 1
             n = len(ids)
             if n and row[end - n:end].tolist() == ids:
                 labels[i, end - n:end] = row[end - n:end]
@@ -132,10 +137,30 @@ class Batcher:
         return enc
 
 
-def evaluate(model, batcher: Batcher, val: list, device, bs: int = 4) -> dict:
+def answer_loss(model, enc):
+    """Cross-entropy of the answer tokens, computing logits ONLY for the last positions.
+    A full [B, L, 150k] logit tensor (+ its fp32 copy and gradient) is several GB for ~1k-token
+    prompts; the answer is the last 2-3 tokens of every (left-padded) row."""
+    import torch.nn.functional as F
+    labels = enc.pop("labels")
+    L = labels.shape[1]
+    cols = (labels != -100).any(0).nonzero().flatten()
+    k = L - int(cols[0]) + 1 if len(cols) else 1          # + 1: the position before the first answer token
+    try:
+        logits = model(**enc, logits_to_keep=k).logits
+    except TypeError:                                     # older transformers: full logits
+        logits = model(**enc).logits
+    logits = logits[:, -k:, :]
+    tgt = labels[:, L - k + 1:]
+    return F.cross_entropy(logits[:, :-1, :].float().reshape(-1, logits.shape[-1]), tgt.reshape(-1), ignore_index=-100)
+
+
+def evaluate(model, batcher: Batcher, val: list, device, bs: int = 4, desc: str = "eval") -> dict:
     import torch
+    import rmot_benchmark as RB
     model.eval()
     ps, ys = [], []
+    pb = RB.bar(len(val), desc, "sample", leave=False)
     with torch.inference_mode():
         for i in range(0, len(val), bs):
             recs = val[i:i + bs]
@@ -148,6 +173,10 @@ def evaluate(model, batcher: Batcher, val: list, device, bs: int = 4) -> dict:
             ln = torch.logsumexp(logits[:, batcher.no_ids], -1)
             ps += torch.sigmoid(ly - ln).tolist()
             ys += [int(r["label"]) for r in recs]
+            pb.update(len(recs))
+            if len(set(ys)) == 2:
+                pb.set_postfix_str(f"AUC so far {auc(ys, ps):.3f}")
+    pb.close()
     model.train()
     p, y = np.array(ps), np.array(ys)
     yh = p > 0.5
@@ -244,14 +273,14 @@ def main():
     warm = max(1, int(total * a.warmup))
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / warm) * max(0.0, 0.5 * (1 + math.cos(math.pi * min(1.0, s / total)))))
-    base = evaluate(model, batcher, val, dev, bs=a.batch)
+    base = evaluate(model, batcher, val, dev, bs=a.batch, desc="eval (before training)")
     print(f"before training: val {json.dumps(base)}", flush=True)
     log.write(json.dumps({"step": 0, **base}) + "\n")
     best = base["auc"] if base["auc"] == base["auc"] else -1
     model.train()
     step, micro, t0 = 0, 0, time.time()
     order = []
-    pb = RB.bar(total, "train", "step")
+    pb = RB.bar(total * a.grad_accum, "train", "batch")
     run_loss = 0.0
     while step < total:
         if not order:
@@ -259,10 +288,11 @@ def main():
             random.shuffle(order)
         idx = [order.pop() for _ in range(min(a.batch, len(order)))]
         enc = batcher.train_batch([train[i] for i in idx]).to(dev)
-        out = model(**enc)
-        (out.loss / a.grad_accum).backward()
-        run_loss += float(out.loss) / a.grad_accum
+        loss = answer_loss(model, enc)
+        (loss / a.grad_accum).backward()
+        run_loss += loss.item() / a.grad_accum
         micro += 1
+        pb.update(1)
         if micro % a.grad_accum:
             continue
         torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
@@ -270,12 +300,11 @@ def main():
         sched.step()
         opt.zero_grad(set_to_none=True)
         step += 1
-        pb.set_postfix_str(f"loss {run_loss:.4f}, lr {sched.get_last_lr()[0]:.1e}, best AUC {best:.3f}")
-        pb.update(1)
+        pb.set_postfix_str(f"step {step}/{total}, loss {run_loss:.4f}, lr {sched.get_last_lr()[0]:.1e}, best AUC {best:.3f}")
         log.write(json.dumps({"step": step, "loss": run_loss, "lr": sched.get_last_lr()[0]}) + "\n")
         run_loss = 0.0
         if step % a.eval_every == 0 or step == total:
-            r = evaluate(model, batcher, val, dev, bs=a.batch)
+            r = evaluate(model, batcher, val, dev, bs=a.batch, desc=f"eval (step {step})")
             log.write(json.dumps({"step": step, **r}) + "\n")
             log.flush()
             pb.write(f"step {step}: val AUC {r['auc']:.3f} acc {r['acc']:.3f} F1 {r['f1']:.3f} yes-rate {r['yes_rate']:.2f}")
