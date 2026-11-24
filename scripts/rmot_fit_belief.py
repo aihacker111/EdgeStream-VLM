@@ -96,6 +96,9 @@ def main():
     ap.add_argument("--max-videos", type=int, default=None)
     ap.add_argument("--max-expr", type=int, default=30, help="expressions per video (random subset)")
     ap.add_argument("--verifier-scores", default=None, help="val_scores_*.jsonl from rmot_train_lora.py --eval-only")
+    ap.add_argument("--verifier-answers", default=None,
+                    help="answers.jsonl from rmot_diagnose.py --mode replay on TRAIN videos: the verifier on the "
+                         "questions the method really asks (preferred over --verifier-scores)")
     ap.add_argument("--out", required=True, help="YAML with rmot.belief (+ rmot.calib) to pass as --belief-params")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -216,13 +219,23 @@ def main():
         belief["kin_ab"] = [round(max(ka, 0.0), 4), round(kb, 4)]
         belief["kin_base"] = round(float(np.mean(kin_y)), 4)
     out = {"rmot": {"belief": belief}}
-    if a.verifier_scores:
+    if a.verifier_scores or a.verifier_answers:
         ps, ys = [], []
-        for path in a.verifier_scores.split(","):
+        for path in (a.verifier_answers or a.verifier_scores).split(","):
             for line in open(path):
                 r = json.loads(line)
+                if r.get("p") is None:
+                    continue
+                if a.verifier_answers:                  # replay log: one candidate per question only
+                    if r.get("group", 1) != 1 or r.get("truth") is None:
+                        continue
+                    lab = int(float(r["truth"]) >= 0.5)
+                else:
+                    lab = int(r["label"])
                 ps.append(min(max(float(r["p"]), 1e-4), 1 - 1e-4))
-                ys.append(int(r["label"]))
+                ys.append(lab)
+        if not ys:
+            sys.exit("no usable verifier answers")
         z = np.log(np.array(ps) / (1 - np.array(ps)))
         A, B = logistic(z, ys)
         base = float(np.mean(ys))

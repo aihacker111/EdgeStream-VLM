@@ -247,6 +247,7 @@ def main():
     ap.add_argument("--vlm-model", default=None)
     ap.add_argument("--vlm-adapter", default=None, help="transformers: LoRA folder (runs/lora_vl2b/best)")
     ap.add_argument("--vlm-batch", type=int, default=None, help="transformers: max requests per forward pass")
+    ap.add_argument("--belief-params", default=None, help="YAML from rmot_fit_belief.py (questions as the method asks them)")
     ap.add_argument("--n-workers", type=int, default=4)
     ap.add_argument("--max-videos", type=int, default=2)
     ap.add_argument("--max-expr", type=int, default=5)
@@ -267,6 +268,10 @@ def main():
     cfg = yaml.safe_load(open(cfg_path))
     fps = float(cfg.get("fps", 30))
     base = dict(cfg.get("rmot") or {})
+    if a.belief_params:                          # the deployed model: questions chosen as in the benchmark
+        with open(a.belief_params) as f:
+            base = RB.deep_update(base, (yaml.safe_load(f) or {}).get("rmot") or {})
+        base.setdefault("belief", {})["enabled"] = True
     base.setdefault("sched", {})["n_workers"] = a.n_workers
     base["zoom"] = False
     split = load_split(a.dataset, a.root, a.split, a.seqmap, fps=fps)
