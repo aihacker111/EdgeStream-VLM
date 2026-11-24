@@ -73,6 +73,9 @@ class BeliefConfig:
     kin_ab: list | None = None
     kin_base: float = 0.15
     ans_corr: float = 0.5           # kappa: the k-th answer about the same piece counts 1 / (1 + kappa k)
+    # verifier calibration used ONLY by this model (baselines keep their own decision rule):
+    # LLR = calib_ab[0] * stored logit + calib_ab[1] - logit(calib_base_rate)
+    calib_ab: list | None = None
     calib_base_rate: float = 0.5    # base rate of the set the verifier was calibrated on
     tpr: float = 0.85               # verifier P(yes | referred)        (fitted on held-out train)
     fpr: float = 0.12               # verifier P(yes | not referred)

@@ -9,7 +9,7 @@ by hand or on test videos:
     rho_prior[t]   Beta prior of the base rate of an expression of type t  (static / motion) moments
     hazard[t]      rate (1/s) at which the referred state of one object changes          switch counts
     kin_ab, kin_base  P(referred | measured-motion score), logistic fit, and its base rate
-    verifier       Platt calibration (calib.single), its base rate, TPR / FPR           --verifier-scores
+    verifier       Platt calibration (belief.calib_ab), its base rate, TPR / FPR   --verifier-answers/-scores
                    (val_scores_*.jsonl written by rmot_train_lora.py --eval-only)
 
 The tracker pieces come from the same perception cache (or --tracks-dir) as the benchmark, so the
@@ -236,7 +236,8 @@ def main():
                 ys.append(lab)
         if not ys:
             sys.exit("no usable verifier answers")
-        z = np.log(np.array(ps) / (1 - np.array(ps)))
+        pc = np.clip(np.array(ps), 0.02, 0.98)              # the pipeline stores logit(p) clipped at 0.02
+        z = np.log(pc / (1 - pc))
         A, B = logistic(z, ys)
         base = float(np.mean(ys))
         cz = A * z + B                                     # calibrated logit (posterior on the val base rate)
@@ -244,8 +245,8 @@ def main():
         y = np.array(ys, bool)
         tpr = float((yes & y).sum() / max(y.sum(), 1))
         fpr = float((yes & ~y).sum() / max((~y).sum(), 1))
-        out["rmot"]["calib"] = {"single": [round(A, 4), round(B, 4)]}
-        belief.update({"calib_base_rate": round(base, 4), "tpr": round(min(max(tpr, 0.51), 0.999), 4),
+        # inside the belief model only: the baselines (filter_*) keep their own yes/no decision rule
+        belief.update({"calib_ab": [round(A, 4), round(B, 4)], "calib_base_rate": round(base, 4), "tpr": round(min(max(tpr, 0.51), 0.999), 4),
                        "fpr": round(min(max(fpr, 0.001), 0.49), 4)})
     stats = {"videos": len(vids), "cuts": {r: c[1] for r, c in same_by_reason.items()}, "stitch_edges": len(stitch_x),
              "expressions": {t: len(v) for t, v in rates.items()},

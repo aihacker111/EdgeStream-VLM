@@ -226,7 +226,8 @@ class OnlineRMOT:
             l = min(math.log(acc / (1 - acc)), b.llr_cap)
             return acc, 1 - acc, (lambda z: l if z > 0 else -l)
         base = logit(b.calib_base_rate)
-        return b.tpr, b.fpr, (lambda z: max(min(z - base, b.llr_cap), -b.llr_cap))
+        ca, cb = b.calib_ab or (1.0, 0.0)
+        return b.tpr, b.fpr, (lambda z: max(min(ca * z + cb - base, b.llr_cap), -b.llr_cap))
 
     def _belief_model(self, g: TrackletGraph, now: float, q: Query) -> BeliefModel:
         key = (round(now, 6), self._ans_ver, self._prior_ver)
